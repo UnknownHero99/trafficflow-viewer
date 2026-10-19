@@ -44,7 +44,7 @@ def build_filter(params, bucket_seconds):
                 op = "NOT IN" if neg else "IN"
                 where.append(f"{col} {op} ({','.join('?' * len(vals))})")
                 args += vals
-    if params.get("lan", "0") != "1":
+    if params.get("lan", "1") == "0":  # local (device <-> device) traffic is shown unless lan=0
         where.append("t.country != 'LAN'")
     q = params.get("q", "").strip()
     if q:

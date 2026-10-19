@@ -212,3 +212,49 @@ class AttributionTest(unittest.TestCase):
             st.flush()
             s = queries.summary(st.db(), {"from": "999000", "to": "1001000"}, 60)
             self.assertEqual([(r["app"], r["up"], r["down"]) for r in s["apps"]], [("backup", 100, 5000)])
+
+
+class LocalTrafficTest(unittest.TestCase):
+    def _store(self, tmp):
+        fakeflow.write_demo_geo(tmp)
+        geo = Geo(tmp, auto_download=False)
+        geo.start()
+        return Store(os.path.join(tmp, "db.sqlite"), geo, Classifier(["192.168.0.0/16"]))
+
+    @staticmethod
+    def _flow(src, dst, sport, dport, nbytes):
+        f = Flow()
+        f.src, f.dst, f.sport, f.dport, f.proto, f.bytes, f.packets = src, dst, sport, dport, 6, nbytes, 1
+        return f
+
+    def test_both_ends_counted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            st = self._store(tmp)
+            # Jellyfin on 192.168.10.10 streams to a TV on 192.168.1.102
+            st.add_flows([self._flow("192.168.10.10", "192.168.1.102", 8096, 51000, 900_000),
+                          self._flow("192.168.1.102", "192.168.10.10", 51000, 8096, 20_000)], now=1_000_000)
+            st.flush()
+            p = {"from": "999000", "to": "1001000"}
+            dev = {r["ip"]: r for r in queries.summary(st.db(), p, 60)["devices"]}
+            self.assertEqual((dev["192.168.10.10"]["up"], dev["192.168.10.10"]["down"]), (900_000, 20_000))
+            self.assertEqual((dev["192.168.1.102"]["up"], dev["192.168.1.102"]["down"]), (20_000, 900_000))
+            # shown by default, hidden with lan=0
+            self.assertEqual(queries.summary(st.db(), p, 60)["totals"]["down"], 920_000)
+            self.assertEqual(queries.summary(st.db(), {**p, "lan": "0"}, 60)["totals"]["down"], 0)
+
+    def test_backfill_old_rows_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            st = self._store(tmp)
+            db = st.db()
+            # how an older version stored the stream: only the sender's upload
+            db.execute("""INSERT INTO traffic (bucket, local_ip, remote_ip, port, proto, app, country, asn,
+                              bytes_up, bytes_down, pkts_up, pkts_down, flows)
+                          VALUES (999960, '192.168.10.10', '192.168.1.102', 8096, 6, '', 'LAN', 0,
+                                  900000, 0, 600, 0, 1)""")
+            db.execute("PRAGMA user_version = 1")
+            db.commit()
+            for _ in range(2):  # second start must not add it again
+                st = Store(os.path.join(tmp, "db.sqlite"), st.geo, Classifier(["192.168.0.0/16"]))
+            row = st.db().execute("""SELECT bytes_up, bytes_down FROM traffic
+                                     WHERE local_ip = '192.168.1.102'""").fetchone()
+            self.assertEqual(tuple(row), (0, 900000))

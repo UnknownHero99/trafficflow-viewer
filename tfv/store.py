@@ -90,6 +90,37 @@ class Store:
         self._migrate(db)
         db.executescript(SCHEMA)
         db.commit()
+        self._backfill_lan(db)
+
+    def _backfill_lan(self, db):
+        """Before version 2, traffic between two of your devices was stored only as the
+        sender's upload. Add the receiver's download side to that history, once."""
+        if db.execute("PRAGMA user_version").fetchone()[0] >= 2:
+            return
+        remotes = [r[0] for r in db.execute("SELECT DISTINCT remote_ip FROM traffic WHERE country = 'LAN'")
+                   if self.cls.is_local(r[0])]
+        if remotes:
+            log.info("adding the receiving side of %d local devices' past traffic (one-off)", len(remotes))
+            db.execute("CREATE TEMP TABLE lan_remotes (ip TEXT PRIMARY KEY)")
+            db.executemany("INSERT INTO lan_remotes VALUES (?)", [(r,) for r in remotes])
+            db.execute(
+                """INSERT INTO traffic (bucket, local_ip, remote_ip, port, proto, app, country, asn,
+                       bytes_up, bytes_down, pkts_up, pkts_down, flows)
+                   SELECT bucket, remote_ip, local_ip, port, proto, '', 'LAN', 0,
+                       bytes_down, bytes_up, pkts_down, pkts_up, flows
+                   FROM traffic WHERE country = 'LAN' AND remote_ip IN (SELECT ip FROM lan_remotes)
+                   ON CONFLICT DO UPDATE SET
+                       bytes_up = bytes_up + excluded.bytes_up,
+                       bytes_down = bytes_down + excluded.bytes_down,
+                       pkts_up = pkts_up + excluded.pkts_up,
+                       pkts_down = pkts_down + excluded.pkts_down,
+                       flows = flows + excluded.flows""")
+            db.executemany(
+                """INSERT INTO devices (ip, first_seen, last_seen) VALUES (?, NULL, NULL)
+                   ON CONFLICT(ip) DO NOTHING""", [(r,) for r in remotes])
+            db.execute("DROP TABLE lan_remotes")
+        db.execute("PRAGMA user_version = 2")
+        db.commit()
 
     @staticmethod
     def _migrate(db):
@@ -142,37 +173,43 @@ class Store:
                     elif f.nat_src and is_local(f.nat_src):
                         src, sl = f.nat_src, True
                         sport = f.nat_sport or sport
+                # A device reaching another one through the router's public address
+                # (hairpin NAT) is local traffic too.
+                if sl and not dl and f.nat_dst and is_local(f.nat_dst):
+                    dst, dl = f.nat_dst, True
+                    dport = f.nat_dport or dport
+                # Each side that is one of ours gets its own row: the sender as upload,
+                # the receiver as download. Traffic between two of your devices (e.g. a
+                # Jellyfin server streaming to a TV) therefore shows on both of them.
+                sides = []
                 if sl:
-                    local, remote, upload = src, dst, True
-                    lport, rport = sport, dport
-                    mac = f.src_mac
-                elif dl:
-                    local, remote, upload = dst, src, False
-                    lport, rport = dport, sport
-                    # Download flows are usually recorded on the WAN port, where the
-                    # destination MAC is the router's own, so never learn MACs from them.
-                    mac = None
-                else:
+                    sides.append((src, dst, sport, dport, True, f.src_mac))
+                if dl:
+                    # The destination MAC of a routed packet is the router's own, so
+                    # only learn MACs from the sending side.
+                    sides.append((dst, src, dport, sport, False, None))
+                if not sides:
                     self.stats["unclassified_flows"] += 1
                     continue
                 if f.proto in (6, 17, 132):
                     port = min(f.sport, f.dport) if f.sport and f.dport else (f.sport or f.dport)
                 else:
                     port = 0
-                app = attr.lookup(local, f.proto, lport, remote, rport) if attr else ""
-                key = (bucket, local, remote, port, f.proto, app)
-                agg = self._pending.get(key)
-                if agg is None:
-                    agg = self._pending[key] = [0, 0, 0, 0, 0]
-                if upload:
-                    agg[0] += f.bytes
-                    agg[2] += f.packets
-                else:
-                    agg[1] += f.bytes
-                    agg[3] += f.packets
-                agg[4] += 1
-                prev = self._devices_seen.get(local)
-                self._devices_seen[local] = (mac or (prev[0] if prev else None), now)
+                for local, remote, lport, rport, upload, mac in sides:
+                    app = attr.lookup(local, f.proto, lport, remote, rport) if attr else ""
+                    key = (bucket, local, remote, port, f.proto, app)
+                    agg = self._pending.get(key)
+                    if agg is None:
+                        agg = self._pending[key] = [0, 0, 0, 0, 0]
+                    if upload:
+                        agg[0] += f.bytes
+                        agg[2] += f.packets
+                    else:
+                        agg[1] += f.bytes
+                        agg[3] += f.packets
+                    agg[4] += 1
+                    prev = self._devices_seen.get(local)
+                    self._devices_seen[local] = (mac or (prev[0] if prev else None), now)
                 self.stats["stored_flows"] += 1
                 self.stats["last_flow"] = now
 

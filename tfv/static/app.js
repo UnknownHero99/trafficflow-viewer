@@ -102,7 +102,7 @@ function htmlLabel(dim, v) {
 
 // ---------- state ----------
 const state = {
-  range: 3600, from: null, to: null, lan: false, q: "", tab: "countries",
+  range: 3600, from: null, to: null, lan: true, q: "", tab: "countries",
   inc: Object.fromEntries(DIM_KEYS.map((k) => [k, []])),
   exc: Object.fromEntries(DIM_KEYS.map((k) => [k, []])),
   sort: {},
@@ -117,7 +117,7 @@ function readHash() {
   state.from = +p.get("from") || null;
   state.to = +p.get("to") || null;
   state.range = +p.get("range") || 3600;
-  state.lan = p.get("lan") === "1";
+  state.lan = p.get("lan") !== "0";  // local traffic is on unless the link says lan=0
   state.q = p.get("q") || "";
   state.tab = p.get("tab") || "countries";
   for (const k of DIM_KEYS) {
@@ -140,7 +140,7 @@ function timeParams(p) {
 }
 function writeHash() {
   const p = timeParams(new URLSearchParams());
-  if (state.lan) p.set("lan", "1");
+  if (!state.lan) p.set("lan", "0");
   if (state.q) p.set("q", state.q);
   if (state.tab !== "countries") p.set("tab", state.tab);
   filterParams(p);
