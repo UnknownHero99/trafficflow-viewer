@@ -27,6 +27,8 @@ services:
     profiles: [agent]
     restart: unless-stopped
     command: ["python", "-m", "tfv.agent"]
+    healthcheck:
+      disable: true   # the image's check probes the web UI, which the agent doesn't serve
     network_mode: host
     pid: host
     cap_add: [NET_ADMIN, SYS_PTRACE]
