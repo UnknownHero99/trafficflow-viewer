@@ -1,0 +1,15 @@
+# Build and run from this checkout (no automatic updates):
+#   docker compose -f docker-compose.dev.yml up -d --build
+services:
+  trafficflow:
+    build: .
+    image: trafficflow-viewer:dev
+    container_name: trafficflow
+    restart: unless-stopped
+    ports:
+      - "2055:2055/udp"
+      - "8080:8080"
+    volumes:
+      - ./data:/data
+    environment:
+      - TZ=${TZ:-Europe/Ljubljana}

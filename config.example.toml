@@ -1,0 +1,49 @@
+# TrafficFlow Viewer configuration.
+# Copy to config.toml (or data/config.toml when using Docker) and edit.
+# Every setting is optional; the values shown are the defaults.
+
+[collector]
+listen = "0.0.0.0"
+port = 2055                 # UDP port the router sends Traffic Flow to
+
+[web]
+listen = "0.0.0.0"
+port = 8080
+# Set both to require a login for the web UI:
+# username = "admin"
+# password = "change-me"
+
+[storage]
+# path = "data/tfv.sqlite"
+bucket_seconds = 60         # time resolution of stored data
+retention_days = 30         # older data is deleted automatically
+
+[network]
+# Addresses that count as "my devices". Add your public IPv6 prefix here
+# (e.g. "2a01:db8:1234::/48") if you want IPv6 devices recognised too.
+local_networks = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7", "fe80::/10"]
+# Traffic to/from these is dropped (multicast, broadcast).
+ignore_networks = ["224.0.0.0/4", "255.255.255.255/32", "ff00::/8"]
+
+[geoip]
+# Free DB-IP Lite country + ASN databases are downloaded automatically
+# (and refreshed monthly) into data_dir. Licence: CC BY 4.0, https://db-ip.com
+auto_download = true
+# data_dir = "data"
+# Or point at MaxMind GeoLite2 files instead:
+# country_db = "/path/GeoLite2-Country.mmdb"
+# asn_db = "/path/GeoLite2-ASN.mmdb"
+
+[mikrotik]
+# Optional: read device names from the router's DHCP leases (RouterOS v7 REST API).
+# Lease comment is used if set, otherwise the client's host name.
+# Create a read-only user on the router:
+#   /user group add name=tfv-read policy=read,api,rest-api
+#   /user add name=tfv group=tfv-read password=...
+# and make sure /ip service "www-ssl" (or "www") is enabled.
+enabled = false
+url = "https://192.168.88.1"
+username = "tfv"
+password = ""
+verify_tls = false          # RouterOS uses a self-signed certificate by default
+interval = 300              # seconds between syncs

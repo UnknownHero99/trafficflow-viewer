@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TrafficFlow Viewer</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='3' fill='%232a78d6'/><path d='M3 11h2V7H3zm4 0h2V4H7zm4 0h2V8h-2z' fill='white'/></svg>">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <svg viewBox="0 0 16 16" width="22" height="22" aria-hidden="true"><rect width="16" height="16" rx="3" fill="var(--series-1)"/><path d="M3 11h2V7H3zm4 0h2V4H7zm4 0h2V8h-2z" fill="#fff"/></svg>
+    <span>TrafficFlow</span>
+  </div>
+  <div id="status-pill" class="pill" title="Collector status">…</div>
+  <div class="spacer"></div>
+  <div class="seg" id="range" role="group" aria-label="Time range">
+    <button data-r="900">15m</button><button data-r="3600">1h</button><button data-r="21600">6h</button><button data-r="86400">24h</button><button data-r="604800">7d</button><button data-r="2592000">30d</button>
+  </div>
+  <label class="toggle" title="Refresh every 30 seconds"><input type="checkbox" id="auto" checked> Live</label>
+  <button class="icon-btn" id="theme" title="Toggle dark mode" aria-label="Toggle dark mode">◐</button>
+</header>
+
+<section class="filterbar" aria-label="Filters">
+  <button class="btn primary" id="add-filter">＋ Add filter</button>
+  <div id="chips" class="chips"></div>
+  <span class="grow"></span>
+  <input id="search" type="search" placeholder="Search IP, name, organisation…  ( / )" autocomplete="off">
+  <label class="toggle" title="Include traffic between your own devices"><input type="checkbox" id="lan"> LAN↔LAN</label>
+</section>
+
+<main>
+  <section class="kpis" id="kpis"></section>
+
+  <section class="card chart-card">
+    <div class="card-head">
+      <h2>Traffic over time <span class="muted hint-inline">drag to zoom</span></h2>
+      <div class="legend"><span class="sw down"></span>Download <span class="sw up"></span>Upload</div>
+    </div>
+    <div id="chart" class="chart"></div>
+  </section>
+
+  <section class="card">
+    <nav class="tabs" id="tabs" role="tablist">
+      <button data-tab="countries" class="active">Countries</button>
+      <button data-tab="heatmap">Country heatmap</button>
+      <button data-tab="devices">My devices</button>
+      <button data-tab="orgs">Organisations</button>
+      <button data-tab="remotes">Remote hosts</button>
+      <button data-tab="ports">Services</button>
+      <button data-tab="connections">Connections</button>
+      <button data-tab="status">Status</button>
+    </nav>
+    <div id="panel" class="panel"></div>
+  </section>
+</main>
+
+<aside id="drawer" class="drawer" aria-label="Details"></aside>
+<script src="app.js"></script>
+</body>
+</html>

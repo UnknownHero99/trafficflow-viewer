@@ -1,0 +1,8 @@
+# runtime data: database, GeoIP files, local config (may contain passwords)
+data/
+config.toml
+.env
+
+__pycache__/
+*.pyc
+.claude/

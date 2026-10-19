@@ -1,0 +1,216 @@
+"""SQLite storage: per-time-bucket aggregates of traffic between a local
+device and a remote host, plus device names."""
+
+import ipaddress
+import logging
+import sqlite3
+import threading
+import time
+
+log = logging.getLogger("tfv.store")
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS traffic (
+    bucket      INTEGER NOT NULL,  -- unix time, start of bucket
+    local_ip    TEXT    NOT NULL,
+    remote_ip   TEXT    NOT NULL,
+    port        INTEGER NOT NULL,  -- service port (lower of the two ports)
+    proto       INTEGER NOT NULL,
+    country     TEXT    NOT NULL,
+    asn         INTEGER NOT NULL,
+    bytes_up    INTEGER NOT NULL DEFAULT 0,  -- local -> remote
+    bytes_down  INTEGER NOT NULL DEFAULT 0,  -- remote -> local
+    pkts_up     INTEGER NOT NULL DEFAULT 0,
+    pkts_down   INTEGER NOT NULL DEFAULT 0,
+    flows       INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (bucket, local_ip, remote_ip, port, proto)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS traffic_country ON traffic(country, bucket);
+CREATE INDEX IF NOT EXISTS traffic_local ON traffic(local_ip, bucket);
+
+CREATE TABLE IF NOT EXISTS devices (
+    ip          TEXT PRIMARY KEY,
+    name        TEXT,
+    mac         TEXT,
+    name_source TEXT,   -- 'manual' or 'dhcp'
+    first_seen  INTEGER,
+    last_seen   INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS asn_names (
+    asn  INTEGER PRIMARY KEY,
+    org  TEXT
+);
+"""
+
+
+class Classifier:
+    """Decides which side of a flow is "ours"."""
+
+    def __init__(self, local_nets, ignore_nets=()):
+        self.local = [ipaddress.ip_network(n, strict=False) for n in local_nets]
+        self.ignore = [ipaddress.ip_network(n, strict=False) for n in ignore_nets]
+        self._cache = {}
+
+    def is_local(self, ip):
+        r = self._cache.get(ip)
+        if r is None:
+            a = ipaddress.ip_address(ip)
+            r = any(a in n for n in self.local)
+            if len(self._cache) > 100000:
+                self._cache.clear()
+            self._cache[ip] = r
+        return r
+
+    def ignored(self, ip):
+        if not self.ignore:
+            return False
+        a = ipaddress.ip_address(ip)
+        return any(a in n for n in self.ignore)
+
+
+class Store:
+    def __init__(self, path, geo, classifier, bucket_seconds=60, retention_days=30):
+        self.path = path
+        self.geo = geo
+        self.cls = classifier
+        self.bucket_seconds = bucket_seconds
+        self.retention_days = retention_days
+        self._local = threading.local()
+        self._pending = {}
+        self._devices_seen = {}   # ip -> (mac, last_seen)
+        self._asn_seen = {}
+        self._lock = threading.Lock()
+        self.stats = {"stored_flows": 0, "unclassified_flows": 0,
+                      "ignored_flows": 0, "last_flow": 0}
+        db = self.db()
+        db.executescript(SCHEMA)
+        db.commit()
+
+    def db(self):
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self.path, timeout=30)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            self._local.conn = conn
+        return conn
+
+    # ---- ingest ---------------------------------------------------------
+    def add_flows(self, flows, now=None):
+        now = int(now or time.time())
+        bucket = now - now % self.bucket_seconds
+        is_local = self.cls.is_local
+        with self._lock:
+            for f in flows:
+                src, dst = f.src, f.dst
+                if self.cls.ignored(src) or self.cls.ignored(dst):
+                    self.stats["ignored_flows"] += 1
+                    continue
+                sl, dl = is_local(src), is_local(dst)
+                # Use post-NAT addresses to find the LAN host if needed.
+                if not sl and not dl:
+                    if f.nat_dst and is_local(f.nat_dst):
+                        dst, dl = f.nat_dst, True
+                    elif f.nat_src and is_local(f.nat_src):
+                        src, sl = f.nat_src, True
+                if sl:
+                    local, remote, upload = src, dst, True
+                    mac = f.src_mac
+                elif dl:
+                    local, remote, upload = dst, src, False
+                    # Download flows are usually recorded on the WAN port, where the
+                    # destination MAC is the router's own, so never learn MACs from them.
+                    mac = None
+                else:
+                    self.stats["unclassified_flows"] += 1
+                    continue
+                if f.proto in (6, 17, 132):
+                    port = min(f.sport, f.dport) if f.sport and f.dport else (f.sport or f.dport)
+                else:
+                    port = 0
+                key = (bucket, local, remote, port, f.proto)
+                agg = self._pending.get(key)
+                if agg is None:
+                    agg = self._pending[key] = [0, 0, 0, 0, 0]
+                if upload:
+                    agg[0] += f.bytes
+                    agg[2] += f.packets
+                else:
+                    agg[1] += f.bytes
+                    agg[3] += f.packets
+                agg[4] += 1
+                prev = self._devices_seen.get(local)
+                self._devices_seen[local] = (mac or (prev[0] if prev else None), now)
+                self.stats["stored_flows"] += 1
+                self.stats["last_flow"] = now
+
+    def flush(self):
+        with self._lock:
+            pending, self._pending = self._pending, {}
+            devices, self._devices_seen = self._devices_seen, {}
+        if not pending and not devices:
+            return
+        rows = []
+        new_asns = []
+        for (bucket, local, remote, port, proto), (bu, bd, pu, pd, n) in pending.items():
+            cc = self.geo.lookup_country(remote)
+            asn, org = self.geo.lookup_asn(remote)
+            if asn and asn not in self._asn_seen:
+                self._asn_seen[asn] = org
+                new_asns.append((asn, org))
+            rows.append((bucket, local, remote, port, proto, cc, asn, bu, bd, pu, pd, n))
+        db = self.db()
+        with db:
+            db.executemany(
+                """INSERT INTO traffic (bucket, local_ip, remote_ip, port, proto, country,
+                       asn, bytes_up, bytes_down, pkts_up, pkts_down, flows)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT DO UPDATE SET
+                       bytes_up = bytes_up + excluded.bytes_up,
+                       bytes_down = bytes_down + excluded.bytes_down,
+                       pkts_up = pkts_up + excluded.pkts_up,
+                       pkts_down = pkts_down + excluded.pkts_down,
+                       flows = flows + excluded.flows""", rows)
+            if new_asns:
+                db.executemany("INSERT OR REPLACE INTO asn_names VALUES (?,?)", new_asns)
+            db.executemany(
+                """INSERT INTO devices (ip, mac, first_seen, last_seen) VALUES (?,?,?,?)
+                   ON CONFLICT(ip) DO UPDATE SET
+                       last_seen = excluded.last_seen,
+                       mac = COALESCE(excluded.mac, devices.mac)""",
+                [(ip, mac, ts, ts) for ip, (mac, ts) in devices.items()])
+
+    def prune(self):
+        cutoff = int(time.time()) - self.retention_days * 86400
+        db = self.db()
+        with db:
+            n = db.execute("DELETE FROM traffic WHERE bucket < ?", (cutoff,)).rowcount
+        if n:
+            log.info("pruned %d old rows", n)
+
+    # ---- devices --------------------------------------------------------
+    def set_device_name(self, ip, name, source="manual"):
+        db = self.db()
+        with db:
+            if source == "dhcp":
+                # never overwrite a name the user typed in
+                db.execute(
+                    """INSERT INTO devices (ip, name, name_source) VALUES (?,?,?)
+                       ON CONFLICT(ip) DO UPDATE SET name = excluded.name,
+                           name_source = excluded.name_source
+                       WHERE devices.name_source IS NOT 'manual' OR devices.name IS NULL""",
+                    (ip, name, source))
+            else:
+                db.execute(
+                    """INSERT INTO devices (ip, name, name_source) VALUES (?,?,?)
+                       ON CONFLICT(ip) DO UPDATE SET name = excluded.name,
+                           name_source = excluded.name_source""",
+                    (ip, name or None, source if name else None))
+
+    def set_device_mac(self, ip, mac):
+        db = self.db()
+        with db:
+            db.execute("""INSERT INTO devices (ip, mac) VALUES (?,?)
+                          ON CONFLICT(ip) DO UPDATE SET mac = excluded.mac""", (ip, mac))

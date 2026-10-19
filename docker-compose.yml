@@ -1,0 +1,33 @@
+# Server deployment: runs the image that GitHub Actions publishes to ghcr.io and
+# keeps it up to date. To build from source instead, use docker-compose.dev.yml.
+services:
+  trafficflow:
+    image: ${TFV_IMAGE:-ghcr.io/unknownhero99/trafficflow-viewer:latest}
+    container_name: trafficflow
+    restart: unless-stopped
+    ports:
+      - "2055:2055/udp"   # MikroTik sends flows here
+      - "8080:8080"       # web UI
+    volumes:
+      - ./data:/data      # database, GeoIP files and optional config.toml
+    environment:
+      - TZ=${TZ:-Europe/Ljubljana}
+    labels:
+      # opt in to automatic updates (Watchtower below ignores every other container)
+      - com.centurylinklabs.watchtower.enable=true
+
+  # Checks ghcr.io for a new image every UPDATE_INTERVAL seconds and restarts the
+  # app with it. Maintained fork of containrrr/watchtower (which fails on Docker 29+).
+  watchtower:
+    image: nickfedor/watchtower:1.23.1
+    container_name: trafficflow-watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Only if the image is private: run `docker login ghcr.io` on the server, then uncomment.
+      # - ${HOME}/.docker/config.json:/config.json:ro
+    environment:
+      - WATCHTOWER_LABEL_ENABLE=true
+      - WATCHTOWER_POLL_INTERVAL=${UPDATE_INTERVAL:-300}
+      - WATCHTOWER_CLEANUP=true
+      - TZ=${TZ:-Europe/Ljubljana}
