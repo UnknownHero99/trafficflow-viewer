@@ -51,7 +51,7 @@ Check `TFV_IMAGE` in `.env` (your GitHub user name, in lower case), then start i
 docker compose up -d
 ```
 
-- Web UI: `http://<server-ip>:8080`
+- Web UI: `http://<server-ip>:8321` (change with `TFV_WEB_PORT` in `.env`)
 - Flow collector: UDP port `2055`
 - Everything is stored in `./data` (SQLite database, GeoIP files, optional `config.toml`).
 - Watchtower checks for a new image every 5 minutes (`UPDATE_INTERVAL` in `.env`) and restarts

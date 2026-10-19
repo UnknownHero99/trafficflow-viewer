@@ -7,7 +7,7 @@ services:
     restart: unless-stopped
     ports:
       - "2055:2055/udp"   # MikroTik sends flows here
-      - "${TFV_WEB_PORT:-8080}:8080"   # web UI
+      - "${TFV_WEB_PORT:-8321}:8080"   # web UI (8080 inside the container)
     volumes:
       - ./data:/data      # database, GeoIP files and optional config.toml
     environment:
@@ -37,7 +37,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     environment:
       - TFV_RUN_AS_ROOT=1
-      - TFV_URL=${TFV_AGENT_URL:-http://127.0.0.1:${TFV_WEB_PORT:-8080}}
+      - TFV_URL=${TFV_AGENT_URL:-http://127.0.0.1:${TFV_WEB_PORT:-8321}}
       - TFV_AGENT_TOKEN=${TFV_AGENT_TOKEN:-}
       - TZ=${TZ:-Europe/Ljubljana}
     labels:
