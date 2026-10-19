@@ -5,10 +5,23 @@ flows. Flow records arrive up to a minute or two after a connection was
 active, so entries are kept for a while after the agent last saw them.
 """
 
+import hashlib
 import threading
 import time
 
 TTL = 15 * 60  # seconds an entry stays valid after the agent last reported it
+
+
+def clean_token(token):
+    """Agent token as configured, minus stray spaces/newlines and quotes that GUIs
+    and YAML lists (`- TFV_AGENT_TOKEN="abc"`) tend to leave in."""
+    return (token or "").strip().strip("\"'").strip()
+
+
+def token_fingerprint(token):
+    """Short, non-secret fingerprint so you can compare the agent's and the
+    viewer's token without showing either."""
+    return hashlib.sha256(token.encode()).hexdigest()[:8] if token else ""
 
 
 class Attribution:

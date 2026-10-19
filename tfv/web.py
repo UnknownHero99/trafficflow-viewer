@@ -16,6 +16,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import queries
+from .attribution import clean_token, token_fingerprint
 
 log = logging.getLogger("tfv.web")
 STATIC = os.path.join(os.path.dirname(__file__), "static")
@@ -53,7 +54,7 @@ class App:
     def __init__(self, store, decoder, collector, geo, lease_sync=None,
                  username=None, password=None, attribution=None, agent_token=""):
         self.attribution = attribution
-        self.agent_token = agent_token
+        self.agent_token = clean_token(agent_token)
         self.store = store
         self.decoder = decoder
         self.collector = collector
@@ -102,7 +103,8 @@ class App:
                       "retention_days": self.store.retention_days},
             "geo": self.geo.status,
             "lease_sync": self.lease_sync.status if self.lease_sync else None,
-            "agents": dict(self.attribution.info(), token_set=bool(self.agent_token))
+            "agents": dict(self.attribution.info(), token_set=bool(self.agent_token),
+                           token_fingerprint=token_fingerprint(self.agent_token))
                       if self.attribution else None,
         }
 
@@ -204,13 +206,14 @@ def make_handler(app):
 
         def _agent_report(self):
             """Connection owners from an agent. Uses its own shared token (not the UI login)."""
-            token = self.headers.get("X-Agent-Token", "")
+            token = clean_token(self.headers.get("X-Agent-Token", ""))
             sender = self.client_address[0]
             if not app.agent_token:
                 app.attribution.reject(sender, "the viewer has no TFV_AGENT_TOKEN set")
                 return self._send(403, {"error": "agent reports are off: set TFV_AGENT_TOKEN on the viewer"})
             if not hmac.compare_digest(token, app.agent_token):
-                app.attribution.reject(sender, "wrong token" if token else "no token sent")
+                app.attribution.reject(sender, f"wrong token (agent's fingerprint {token_fingerprint(token)})"
+                                       if token else "no token sent")
                 return self._send(401, {"error": "agent token doesn't match the viewer's TFV_AGENT_TOKEN"})
             length = int(self.headers.get("Content-Length") or 0)
             if length > 20_000_000:

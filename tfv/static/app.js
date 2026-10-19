@@ -967,10 +967,11 @@ function agentStatus(a) {
   const names = Object.entries(a.agents);
   const rejected = Object.entries(a.rejected || {}).map(([ip, r]) =>
     `<dt>Rejected</dt><dd>${esc(ip)}: ${esc(r.reason)} (${fmtNum(r.count)}×, last ${fmtAgo(r.last)})</dd>`).join("");
-  if (!names.length) return `<p class="muted">${a.token_set ? "Token set; no agent has reported yet." : "Off: set <code>TFV_AGENT_TOKEN</code> to accept agent reports."}</p>${rejected ? `<dl>${rejected}</dl>` : ""}`;
+  if (!names.length) return `<p class="muted">${a.token_set ? `Token set (fingerprint <span class="mono">${esc(a.token_fingerprint)}</span>); no agent has reported yet.` : "Off: set <code>TFV_AGENT_TOKEN</code> to accept agent reports."}</p>${rejected ? `<dl>${rejected}</dl>` : ""}`;
   const rate = a.matched + a.unmatched ? fmtPct(a.matched / (a.matched + a.unmatched)) : "—";
   return `<dl>${names.map(([n, x]) => `<dt>${esc(n)}</dt><dd>${esc((x.ips || []).join(", ") || "no addresses yet")}, last report ${fmtAgo(x.last)}</dd>`).join("")}
-    <dt>Flows matched</dt><dd>${rate} of flows from covered hosts</dd>${rejected}</dl>`;
+    <dt>Flows matched</dt><dd>${rate} of flows from covered hosts</dd>
+    <dt>Token fingerprint</dt><dd class="mono">${esc(a.token_fingerprint || "—")}</dd>${rejected}</dl>`;
 }
 
 async function loadRdns(ips, root = document) {

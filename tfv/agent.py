@@ -29,6 +29,8 @@ import threading
 import time
 import urllib.request
 
+from .attribution import clean_token, token_fingerprint
+
 log = logging.getLogger("tfv.agent")
 
 PROTOS = {"tcp": 6, "udp": 17}
@@ -206,7 +208,7 @@ class Agent:
     def __init__(self, url, token, name=None, interval=0.5, docker_sock="/var/run/docker.sock",
                  proc="/proc"):
         self.url = url.rstrip("/") + "/api/agent/report"
-        self.token = token
+        self.token = clean_token(token)
         self.name = name or socket.gethostname()
         self.interval = interval
         self.docker_sock = docker_sock
@@ -334,10 +336,12 @@ class Agent:
         log.info("agent %s reporting to %s (every %ss and on new connections)", self.name, self.url,
                  self.interval)
         self.watch_new_connections()
+        log.info("token fingerprint %s (must match the viewer's Status tab)", token_fingerprint(self.token))
         failures = 0
         while True:
-            # wait for a new connection or the regular interval, but at most 10 rounds/s
-            self.wake.wait(self.interval)
+            # wait for a new connection or the regular interval, but at most 10 rounds/s;
+            # while the viewer refuses or is unreachable, back off up to a minute
+            self.wake.wait(self.interval if not failures else min(60, 2 ** min(failures - 1, 6)))
             self.wake.clear()
             started = time.time()
             try:
@@ -347,10 +351,11 @@ class Agent:
                 failures = 0
             except Exception as e:  # noqa: BLE001 - viewer restarts, network blips
                 failures += 1
-                if failures in (1, 10) or failures % 100 == 0:
+                if failures <= 3 or failures % 10 == 0:
                     hint = ""
                     if getattr(e, "code", None) == 401:
-                        hint = " - TFV_AGENT_TOKEN differs between the agent and the viewer"
+                        hint = (f" - TFV_AGENT_TOKEN differs from the viewer's (agent fingerprint "
+                                f"{token_fingerprint(self.token)}; compare with the viewer's Status tab)")
                     elif getattr(e, "code", None) == 403:
                         hint = " - the viewer has no TFV_AGENT_TOKEN set"
                     elif isinstance(getattr(e, "reason", e), (ConnectionRefusedError, TimeoutError, OSError)):
@@ -362,7 +367,7 @@ class Agent:
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     url = os.environ.get("TFV_URL", "http://127.0.0.1:8080")
-    token = os.environ.get("TFV_AGENT_TOKEN", "")
+    token = clean_token(os.environ.get("TFV_AGENT_TOKEN", ""))
     if not token:
         raise SystemExit("TFV_AGENT_TOKEN must be set (the same value as on the viewer)")
     Agent(url, token, os.environ.get("TFV_AGENT_NAME") or None,

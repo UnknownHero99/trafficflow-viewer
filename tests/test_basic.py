@@ -304,3 +304,13 @@ class Ipv6MergeTest(unittest.TestCase):
             devs = {r["ip"]: r for r in queries.summary(st.db(), {"from": "999000", "to": "1001000"}, 60)["devices"]}
             self.assertEqual(devs["192.168.10.20"]["up"], 17)
             self.assertNotIn("fe80::9e13:9eff:fe0a:4683", devs)
+
+
+class TokenTest(unittest.TestCase):
+    def test_clean_and_fingerprint(self):
+        from tfv.attribution import clean_token, token_fingerprint
+        self.assertEqual(clean_token(' "abc123"\n'), "abc123")
+        self.assertEqual(clean_token("'abc123' "), "abc123")
+        self.assertEqual(token_fingerprint("abc123"), token_fingerprint(clean_token('"abc123"')))
+        self.assertEqual(len(token_fingerprint("abc123")), 8)
+        self.assertEqual(token_fingerprint(""), "")
