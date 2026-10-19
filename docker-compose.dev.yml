@@ -13,3 +13,21 @@ services:
       - ./data:/data
     environment:
       - TZ=${TZ:-Europe/Ljubljana}
+      - TFV_AGENT_TOKEN=${TFV_AGENT_TOKEN:-}
+
+  agent:
+    image: trafficflow-viewer:dev
+    container_name: trafficflow-agent
+    profiles: [agent]
+    restart: unless-stopped
+    command: ["python", "-m", "tfv.agent"]
+    network_mode: host
+    pid: host
+    cap_add: [NET_ADMIN, SYS_PTRACE]
+    security_opt: ["apparmor:unconfined"]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      - TFV_RUN_AS_ROOT=1
+      - TFV_URL=${TFV_AGENT_URL:-http://127.0.0.1:8080}
+      - TFV_AGENT_TOKEN=${TFV_AGENT_TOKEN:-}

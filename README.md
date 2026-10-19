@@ -15,6 +15,7 @@ It collects flows from your router and shows where your traffic goes:
   device, top service and last seen.
 - **Country heatmap**: countries × time grid, showing when each country is busy. Click a
   cell to zoom the whole dashboard into that time.
+- **Apps**: which program or container on your servers caused the traffic (optional agent).
 - **My devices**, **Organisations (ASN)**, **Remote hosts** (with reverse DNS), **Services**.
 - **Connections**: device ↔ host ↔ port, sortable, paged, **CSV export**.
 - **Status**: collector counters, plus the most recent raw flow records for troubleshooting.
@@ -144,6 +145,47 @@ verify_tls = false
 
 `www-ssl` must be enabled under `/ip service` (or use `http://` with the `www` service).
 
+## 4. Optional: which app caused it
+
+The router only sees IP addresses and ports, so all traffic from one server looks the
+same. The **agent** runs on a server and tells the viewer which program or container owns
+each connection. That server's traffic then shows up per app: in the **Apps** tab, as an
+*App* filter, in each device's detail panel and in **Connections**.
+
+It reads:
+- **Docker containers on bridge networks** from the kernel's NAT table (conntrack), which maps
+  each container's address to the server's. This is reliable for the whole connection.
+- **Host programs and host-network containers** from `/proc`, twice a second. Connections
+  shorter than about half a second (e.g. a single DNS query) can be missed and show as
+  *Not attributed*, unless they use a listening port the agent knows (e.g. a DNS server on :53).
+
+Only traffic recorded while the agent runs gets an app; older data stays *Not attributed*.
+
+**On the server that runs the viewer**, add to `.env` (the token is any long random string,
+e.g. from `openssl rand -hex 24`):
+
+```bash
+COMPOSE_PROFILES=agent
+TFV_AGENT_TOKEN=<random string>
+```
+
+```bash
+docker compose up -d
+```
+
+**On another server**, copy `docker-compose.yml` there too, set the same `COMPOSE_PROFILES`
+and `TFV_AGENT_TOKEN`, plus `TFV_AGENT_URL=http://<viewer-ip>:<web-port>`, and start only
+the agent:
+
+```bash
+docker compose up -d agent
+```
+
+The agent needs broad access to that server: host network and processes, `NET_ADMIN` (NAT
+table), `SYS_PTRACE` (which process owns a socket), no AppArmor confinement, and the Docker
+socket. Only run it on servers you control. The Status tab shows each agent, the addresses
+it covers and how many flows get matched.
+
 ## Configuration
 
 See [config.example.toml](config.example.toml). The most useful settings:
@@ -201,6 +243,8 @@ tfv/queries.py    read queries behind the API
 tfv/geo.py        DB-IP / GeoLite2 lookups and automatic monthly download
 tfv/mmdb.py       pure-Python MaxMind DB reader
 tfv/mikrotik.py   optional DHCP lease → device-name sync (RouterOS REST)
+tfv/agent.py      optional agent: which process/container owns each connection
+tfv/attribution.py  viewer side: matches flows to the apps agents reported
 tfv/web.py        HTTP server + JSON API
 tfv/static/       dashboard (plain HTML/CSS/JS, no build step)
 tools/fakeflow.py fake flow generator for testing

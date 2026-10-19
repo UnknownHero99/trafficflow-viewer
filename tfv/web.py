@@ -51,7 +51,9 @@ class RDNS:
 
 class App:
     def __init__(self, store, decoder, collector, geo, lease_sync=None,
-                 username=None, password=None):
+                 username=None, password=None, attribution=None, agent_token=""):
+        self.attribution = attribution
+        self.agent_token = agent_token
         self.store = store
         self.decoder = decoder
         self.collector = collector
@@ -99,6 +101,8 @@ class App:
                       "retention_days": self.store.retention_days},
             "geo": self.geo.status,
             "lease_sync": self.lease_sync.status if self.lease_sync else None,
+            "agents": dict(self.attribution.info(), token_set=bool(self.agent_token))
+                      if self.attribution else None,
         }
 
 
@@ -170,6 +174,8 @@ def make_handler(app):
             return self._static(path)
 
         def do_POST(self):
+            if self.path == "/api/agent/report":
+                return self._agent_report()
             if not self._authorized():
                 return
             # Requiring JSON forces a CORS preflight, so other sites can't POST here.
@@ -195,9 +201,32 @@ def make_handler(app):
                 return self._send(200, {"ok": True, "status": app.lease_sync.status})
             return self._send(404, {"error": "not found"})
 
+        def _agent_report(self):
+            """Connection owners from an agent. Uses its own shared token (not the UI login)."""
+            token = self.headers.get("X-Agent-Token", "")
+            if not app.agent_token:
+                return self._send(403, {"error": "agent reports are off: set TFV_AGENT_TOKEN on the viewer"})
+            if not hmac.compare_digest(token, app.agent_token):
+                return self._send(401, {"error": "bad agent token"})
+            length = int(self.headers.get("Content-Length") or 0)
+            if length > 20_000_000:
+                return self._send(413, {"error": "too large"})
+            try:
+                body = json.loads(self.rfile.read(length))
+                app.attribution.report(
+                    str(body.get("agent") or self.client_address[0])[:64],
+                    [(str(ip), int(p), int(lp), str(rip), int(rp), str(a)[:64])
+                     for ip, p, lp, rip, rp, a in body.get("exact", [])],
+                    [(str(ip), int(p), int(port), str(a)[:64]) for ip, p, port, a in body.get("bound", [])],
+                    {str(ip) for ip in body.get("ips", [])},
+                )
+            except (ValueError, TypeError) as e:
+                return self._send(400, {"error": f"bad report: {e}"})
+            return self._send(200, {"ok": True})
+
         def _csv(self, rows):
             buf = io.StringIO()
-            cols = ["local", "name", "remote", "cc", "asn", "org", "port", "proto",
+            cols = ["local", "name", "app", "remote", "cc", "asn", "org", "port", "proto",
                     "down", "up", "total", "flows", "first", "last"]
             w = csv.writer(buf)
             w.writerow(cols)

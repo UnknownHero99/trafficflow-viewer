@@ -47,7 +47,7 @@ DEDUP_WINDOW = 300  # seconds an identical record is treated as a duplicate
 class Flow:
     __slots__ = ("src", "dst", "sport", "dport", "proto", "bytes", "packets",
                  "in_if", "out_if", "src_mac", "dst_mac",
-                 "nat_src", "nat_dst", "exporter", "raw")
+                 "nat_src", "nat_dst", "nat_sport", "nat_dport", "exporter", "raw")
 
     def __init__(self):
         self.src = self.dst = None
@@ -57,6 +57,7 @@ class Flow:
         self.in_if = self.out_if = 0
         self.src_mac = self.dst_mac = None
         self.nat_src = self.nat_dst = None
+        self.nat_sport = self.nat_dport = 0
         self.exporter = None
         self.raw = None  # {field id: bytes} for v9/IPFIX, kept for the debug view
 
@@ -108,6 +109,7 @@ def _flow_from_fields(fields, exporter):
         f.dst_mac = _mac(get(F_DST_MAC))
     elif get(F_OUT_DST_MAC):
         f.dst_mac = _mac(get(F_OUT_DST_MAC))
+    f.nat_sport, f.nat_dport = num(F_POSTNAT_SRC_PORT), num(F_POSTNAT_DST_PORT)
     ns, nd = get(F_POSTNAT_SRC_V4), get(F_POSTNAT_DST_V4)
     if ns and ns != b"\x00\x00\x00\x00":
         f.nat_src = _ip(ns)

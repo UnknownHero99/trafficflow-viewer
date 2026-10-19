@@ -7,13 +7,38 @@ services:
     restart: unless-stopped
     ports:
       - "2055:2055/udp"   # MikroTik sends flows here
-      - "8080:8080"       # web UI
+      - "${TFV_WEB_PORT:-8080}:8080"   # web UI
     volumes:
       - ./data:/data      # database, GeoIP files and optional config.toml
     environment:
       - TZ=${TZ:-Europe/Ljubljana}
+      - TFV_AGENT_TOKEN=${TFV_AGENT_TOKEN:-}
     labels:
       # opt in to automatic updates (Watchtower below ignores every other container)
+      - com.centurylinklabs.watchtower.enable=true
+
+  # Optional: shows which program or container on THIS server caused its traffic.
+  # Turn on with COMPOSE_PROFILES=agent and TFV_AGENT_TOKEN=<random string> in .env.
+  # It needs broad access to the host (host network and processes, the NAT table,
+  # the Docker socket), so only run it on servers you control.
+  agent:
+    image: ${TFV_IMAGE:-ghcr.io/unknownhero99/trafficflow-viewer:latest}
+    container_name: trafficflow-agent
+    profiles: [agent]
+    restart: unless-stopped
+    command: ["python", "-m", "tfv.agent"]
+    network_mode: host
+    pid: host
+    cap_add: [NET_ADMIN, SYS_PTRACE]
+    security_opt: ["apparmor:unconfined"]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      - TFV_RUN_AS_ROOT=1
+      - TFV_URL=${TFV_AGENT_URL:-http://127.0.0.1:${TFV_WEB_PORT:-8080}}
+      - TFV_AGENT_TOKEN=${TFV_AGENT_TOKEN:-}
+      - TZ=${TZ:-Europe/Ljubljana}
+    labels:
       - com.centurylinklabs.watchtower.enable=true
 
   # Checks ghcr.io for a new image every UPDATE_INTERVAL seconds and restarts the

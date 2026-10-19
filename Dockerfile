@@ -1,6 +1,11 @@
 FROM python:3.12-slim
 
-# No third-party packages needed: everything is Python standard library.
+# The app itself is pure Python standard library; `conntrack` is only used by
+# the optional agent (python -m tfv.agent) to read the kernel's NAT table.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends conntrack \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 COPY tfv/ /app/tfv/
 COPY tools/ /app/tools/

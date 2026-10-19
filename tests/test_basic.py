@@ -142,3 +142,73 @@ class StoreTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AgentTest(unittest.TestCase):
+    def test_hex_ip(self):
+        from tfv.agent import _hex_ip
+        self.assertEqual(_hex_ip("0100007F"), "127.0.0.1")
+        self.assertEqual(_hex_ip("0A0AA8C0"), "192.168.10.10")
+        self.assertEqual(_hex_ip("00000000000000000000000001000000"), "::1")
+
+    def test_proc_sockets(self):
+        from tfv.agent import proc_sockets
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "net"))
+            hdr = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+            with open(os.path.join(tmp, "net", "tcp"), "w") as fh:
+                fh.write(hdr)
+                fh.write("   0: 00000000:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 111 1\n")
+                fh.write("   1: 0A0AA8C0:B3F2 01010101:01BB 01 00000000:00000000 00:00000000 00000000  1000        0 222 1\n")
+                fh.write("   2: 0A0AA8C0:B3F3 01010101:01BB 06 00000000:00000000 00:00000000 00000000  1000        0 0 1\n")
+            got = list(proc_sockets(tmp))
+        self.assertEqual(got, [(6, "0.0.0.0", 8080, "0.0.0.0", 0, 111, True),
+                               (6, "192.168.10.10", 46066, "1.1.1.1", 443, 222, False)])
+
+    def test_conntrack_parsing_and_nat_matching(self):
+        from unittest import mock
+        from tfv import agent as ag
+        out = ("tcp      6 431999 ESTABLISHED src=172.17.0.5 dst=1.1.1.1 sport=40000 dport=443 "
+               "src=1.1.1.1 dst=192.168.10.10 sport=443 dport=40001 [ASSURED] mark=0 use=1\n"
+               "udp      17 25 src=192.168.10.20 dst=192.168.10.10 sport=5000 dport=5353 "
+               "src=172.17.0.6 dst=192.168.10.20 sport=53 dport=5000 mark=0 use=1\n")
+        res = mock.Mock(returncode=0, stdout=out, stderr="")
+        with mock.patch.object(ag.subprocess, "run", return_value=res), \
+             mock.patch.object(ag, "docker_containers", return_value=[
+                 {"id": "a" * 64, "name": "web", "ips": {"172.17.0.5"}, "ports": []},
+                 {"id": "b" * 64, "name": "dns", "ips": {"172.17.0.6"}, "ports": [("*", 17, 5353)]}]), \
+             mock.patch.object(ag, "proc_sockets", return_value=[]):
+            exact, bound, ips = ag.Agent("http://x", "t").collect()
+        self.assertIn(("192.168.10.10", 6, 40001, "1.1.1.1", 443, "web"), exact)   # masqueraded out
+        self.assertIn(("192.168.10.10", 17, 5353, "192.168.10.20", 5000, "dns"), exact)  # published in
+        self.assertIn(("*", 17, 5353, "dns"), bound)
+        self.assertEqual(ips, {"192.168.10.10"})
+
+
+class AttributionTest(unittest.TestCase):
+    def test_lookup_and_store(self):
+        from tfv.attribution import Attribution
+        attr = Attribution()
+        attr.report("srv", [("192.168.1.5", 6, 50000, "142.250.1.1", 443, "backup")],
+                    [("*", 17, 53, "pihole")], {"192.168.1.5"})
+        self.assertEqual(attr.lookup("192.168.1.5", 6, 50000, "142.250.1.1", 443), "backup")
+        self.assertEqual(attr.lookup("192.168.1.5", 17, 53, "8.8.8.8", 40000), "pihole")
+        self.assertEqual(attr.lookup("192.168.1.5", 6, 1234, "8.8.8.8", 443), "")
+        self.assertEqual(attr.lookup("192.168.1.9", 6, 50000, "142.250.1.1", 443), "")  # no agent
+        with tempfile.TemporaryDirectory() as tmp:
+            fakeflow.write_demo_geo(tmp)
+            geo = Geo(tmp, auto_download=False)
+            geo.start()
+            st = Store(os.path.join(tmp, "db.sqlite"), geo, Classifier(["192.168.0.0/16"]),
+                       attribution=attr)
+            up, down = Flow(), Flow()
+            up.src, up.dst, up.sport, up.dport, up.proto, up.bytes, up.packets = \
+                "192.168.1.5", "142.250.1.1", 50000, 443, 6, 100, 1
+            # download seen on the WAN side: public address + post-NAT fields
+            down.src, down.dst, down.sport, down.dport, down.proto, down.bytes, down.packets = \
+                "142.250.1.1", "203.0.113.7", 443, 61000, 6, 5000, 4
+            down.nat_dst, down.nat_dport = "192.168.1.5", 50000
+            st.add_flows([up, down], now=1_000_000)
+            st.flush()
+            s = queries.summary(st.db(), {"from": "999000", "to": "1001000"}, 60)
+            self.assertEqual([(r["app"], r["up"], r["down"]) for r in s["apps"]], [("backup", 100, 5000)])

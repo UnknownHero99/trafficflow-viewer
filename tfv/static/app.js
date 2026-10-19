@@ -70,6 +70,7 @@ function ipSortKey(ip) {
 const DIMS = {
   country: { label: "Country", plural: "Countries" },
   device: { label: "Device", plural: "My devices" },
+  app: { label: "App", plural: "Apps" },
   asn: { label: "Organisation", plural: "Organisations" },
   remote: { label: "Remote host", plural: "Remote hosts" },
   port: { label: "Service port", plural: "Services" },
@@ -87,6 +88,7 @@ function textLabel(dim, v) {
     case "asn": return +v === 0 ? "Unknown / local" : labels.asn[v] || "AS" + v;
     case "port": return +v === 0 ? "no port" : v + (SERVICES[v] ? " " + SERVICES[v] : "");
     case "proto": return PROTOS[v] || "proto " + v;
+    case "app": return v || "Not attributed";
     default: return String(v);
   }
 }
@@ -94,6 +96,7 @@ function textLabel(dim, v) {
 function htmlLabel(dim, v) {
   if (dim === "country") return `<span class="flag">${flag(v)}</span>${esc(countryName(v))}`;
   if (dim === "remote") return `<span class="mono">${esc(v)}</span>`;
+  if (dim === "app" && !v) return `<span class="muted">Not attributed</span>`;
   return esc(textLabel(dim, v));
 }
 
@@ -801,6 +804,23 @@ const TABS = {
     return el;
   },
 
+  apps() {
+    const attributed = summary.apps.some((r) => r.app);
+    const el = document.createElement("div");
+    el.innerHTML = `<div class="panel-bar"><span>${attributed
+      ? "Which program or container on your servers caused the traffic. Click one for details."
+      : "No app data yet. Run the TrafficFlow agent on a server to see which program or container caused its traffic (see README: <i>Which app caused it</i>)."}</span></div>`;
+    el.appendChild(table("apps", [
+      { key: "app", label: "App", sort: (r) => r.app || "~", render: (r) => htmlLabel("app", r.app) },
+      { key: "hosts", label: "Runs on", sortable: false, render: (r) => esc(r.hosts.join(", ")) },
+      ...trafficCols,
+      { key: "countries", label: "Countries", num: true, render: (r) => fmtNum(r.countries) },
+      { key: "remotes", label: "Hosts", num: true, render: (r) => fmtNum(r.remotes) },
+      { key: "flows", label: "Flows", num: true, render: (r) => fmtNum(r.flows) },
+    ], summary.apps, { dim: "app", id: (r) => r.app }));
+    return el;
+  },
+
   orgs() {
     for (const r of summary.orgs) labels.asn[r.asn] = r.org || "AS" + r.asn;
     return table("orgs", [
@@ -848,7 +868,7 @@ const TABS = {
       <button class="btn" id="next" ${c.offset + c.limit < data.count ? "" : "disabled"}>Next →</button>
       <a class="btn" href="${csv}">Export CSV</a></div>`;
     const cols = [
-      ["name", "Device"], ["remote", "Remote host"], ["country", "Country"], ["org", "Organisation"],
+      ["name", "Device"], ["app", "App"], ["remote", "Remote host"], ["country", "Country"], ["org", "Organisation"],
       ["port", "Port", true], ["down", "↓ Download", true], ["up", "↑ Upload", true],
       ["flows", "Flows", true], ["last", "Last seen", true],
     ];
@@ -863,6 +883,7 @@ const TABS = {
     for (const r of data.rows) {
       if (r.name) labels.device[r.local] = r.name;
       h += `<tr><td>${open("device", r.local, `${esc(r.name || "")} <span class="mono muted">${esc(r.local)}</span>`)}</td>
+        <td>${r.app ? open("app", r.app, esc(r.app)) : ""}</td>
         <td class="mono">${open("remote", r.remote, esc(r.remote))}</td>
         <td>${open("country", r.cc, countryCell(r.cc))}</td>
         <td>${r.asn ? open("asn", r.asn, esc(r.org || "AS" + r.asn)) : ""}</td>
@@ -875,7 +896,7 @@ const TABS = {
     el.querySelectorAll("th[data-sort]").forEach((th) => th.onclick = () => {
       const k = th.dataset.sort;
       if (c.sort === k) c.dir = c.dir === "asc" ? "desc" : "asc";
-      else { c.sort = k; c.dir = ["name", "remote", "country", "org"].includes(k) ? "asc" : "desc"; }
+      else { c.sort = k; c.dir = ["name", "app", "remote", "country", "org"].includes(k) ? "asc" : "desc"; }
       c.offset = 0; renderPanel();
     });
     $("#prev", el).onclick = () => { c.offset = Math.max(0, c.offset - c.limit); renderPanel(); };
@@ -914,6 +935,7 @@ const TABS = {
         })}</div>
       <div><h3>GeoIP</h3>${dl({ "Country DB": esc(s.geo.country), "ASN DB": esc(s.geo.asn) })}
         <p class="muted"><a href="https://db-ip.com" target="_blank" rel="noopener" style="color:inherit">IP Geolocation by DB-IP</a> (CC BY 4.0)</p>
+        <h3>App agents</h3>${agentStatus(s.agents)}
         <h3>Router DHCP name sync</h3><p class="muted">${s.lease_sync == null ? "Disabled (see <code>[mikrotik]</code> in config.toml)" : esc(s.lease_sync)}</p></div>
       <div style="grid-column:1/-1"><h3>MikroTik setup</h3>
         <p class="muted">Run this in the RouterOS terminal (replace the address with this server's LAN IP if different):</p>
@@ -939,6 +961,15 @@ const TABS = {
   },
 };
 
+function agentStatus(a) {
+  if (!a) return '<p class="muted">Unavailable.</p>';
+  const names = Object.entries(a.agents);
+  if (!names.length) return `<p class="muted">${a.token_set ? "Token set; no agent has reported yet." : "Off: set <code>TFV_AGENT_TOKEN</code> to accept agent reports."}</p>`;
+  const rate = a.matched + a.unmatched ? fmtPct(a.matched / (a.matched + a.unmatched)) : "—";
+  return `<dl>${names.map(([n, x]) => `<dt>${esc(n)}</dt><dd>${esc((x.ips || []).join(", ") || "no addresses yet")}, last report ${fmtAgo(x.last)}</dd>`).join("")}
+    <dt>Flows matched</dt><dd>${rate} of flows from covered hosts</dd></dl>`;
+}
+
 async function loadRdns(ips, root = document) {
   const todo = ips.filter((ip) => !(ip in rdns));
   if (todo.length) {
@@ -952,11 +983,12 @@ async function loadRdns(ips, root = document) {
 // ---------- detail drawer ----------
 // What each kind of item shows when you open it: [dimension, summary key, id key].
 const DRILL = {
-  country: [["device", "devices", "ip"], ["asn", "orgs", "asn"], ["remote", "remotes", "ip"], ["port", "ports", "port"]],
-  device: [["country", "countries", "cc"], ["asn", "orgs", "asn"], ["remote", "remotes", "ip"], ["port", "ports", "port"]],
-  asn: [["country", "countries", "cc"], ["device", "devices", "ip"], ["remote", "remotes", "ip"], ["port", "ports", "port"]],
-  remote: [["device", "devices", "ip"], ["port", "ports", "port"]],
-  port: [["country", "countries", "cc"], ["device", "devices", "ip"], ["asn", "orgs", "asn"], ["remote", "remotes", "ip"]],
+  country: [["device", "devices", "ip"], ["app", "apps", "app"], ["asn", "orgs", "asn"], ["remote", "remotes", "ip"], ["port", "ports", "port"]],
+  device: [["app", "apps", "app"], ["country", "countries", "cc"], ["asn", "orgs", "asn"], ["remote", "remotes", "ip"], ["port", "ports", "port"]],
+  app: [["device", "devices", "ip"], ["country", "countries", "cc"], ["asn", "orgs", "asn"], ["remote", "remotes", "ip"], ["port", "ports", "port"]],
+  asn: [["country", "countries", "cc"], ["device", "devices", "ip"], ["app", "apps", "app"], ["remote", "remotes", "ip"], ["port", "ports", "port"]],
+  remote: [["device", "devices", "ip"], ["app", "apps", "app"], ["port", "ports", "port"]],
+  port: [["country", "countries", "cc"], ["device", "devices", "ip"], ["app", "apps", "app"], ["asn", "orgs", "asn"], ["remote", "remotes", "ip"]],
   proto: [["country", "countries", "cc"], ["device", "devices", "ip"], ["port", "ports", "port"]],
 };
 const drawerStack = [];
@@ -999,6 +1031,7 @@ async function renderDrawer() {
     extra = `<button class="btn" id="drawer-rename">Rename</button>`;
   }
   if (dim === "asn") sub = +id ? `Organisation · AS${esc(id)}` : "Organisation";
+  if (dim === "app") sub = id ? `App · runs on ${esc(data.devices.map((d) => d.name || d.ip).join(", "))}` : "Traffic no agent could match to a program";
   if (dim === "remote") {
     const r = data.remotes[0] || {};
     sub = `Remote host · <span data-rdns="${esc(id)}">${esc(rdns[id] ?? "…")}</span>`;
@@ -1011,7 +1044,7 @@ async function renderDrawer() {
   const stat = (k, v) => `<div class="dstat"><div class="muted">${k}</div><div>${v}</div></div>`;
   const stats = [
     stat("↓ Download", fmtBytes(t.down)), stat("↑ Upload", fmtBytes(t.up)),
-    dim !== "device" ? stat("Devices", fmtNum(t.devices)) : stat("Countries", fmtNum(t.countries)),
+    dim !== "device" && dim !== "app" ? stat("Devices", fmtNum(t.devices)) : stat("Countries", fmtNum(t.countries)),
     dim !== "remote" ? stat("Remote hosts", fmtNum(t.remotes)) : stat("Services", fmtNum(data.ports.length)),
     stat("First seen", t.first ? fmtAgo(t.first) : "—"), stat("Last seen", t.last ? fmtAgo(t.last) : "—"),
   ].join("");
@@ -1030,7 +1063,7 @@ async function renderDrawer() {
       <div class="dchart"></div>`;
   for (const [sdim, key, idKey] of DRILL[dim] || []) {
     const rows = (data[key] || []).filter((r) => String(r[idKey]) !== id);
-    if (!rows.length) continue;
+    if (!rows.length || (sdim === "app" && !rows.some((r) => r.app))) continue;  // no agent data
     const max = Math.max(...rows.map(totalOf));
     h += `<h3>${DIMS[sdim].plural} <span class="muted">${rows.length > 8 ? "top 8 of " + rows.length : rows.length}</span></h3><div class="dlist">`;
     for (const r of rows.slice(0, 8)) {
@@ -1039,6 +1072,7 @@ async function renderDrawer() {
       if (sdim === "device") { name = esc(r.name || r.ip); note = r.name ? r.ip : ""; }
       if (sdim === "asn") { name = esc(r.org || (+rid ? "AS" + rid : "Unknown / local")); }
       if (sdim === "remote") note = r.org || "";
+      if (sdim === "app" && dim !== "device") note = r.hosts?.join(", ") || "";
       if (sdim === "port") { name = `<span class="mono">${rid || "—"}</span> ${esc(PROTOS[r.proto] || "")}`; note = serviceName(rid, r.proto); }
       h += `<button class="ditem" data-dim="${sdim}" data-id="${esc(rid)}">
         <span class="dname">${name}${note ? ` <span class="muted">${esc(note)}</span>` : ""}</span>

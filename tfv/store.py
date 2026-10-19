@@ -23,7 +23,8 @@ CREATE TABLE IF NOT EXISTS traffic (
     pkts_up     INTEGER NOT NULL DEFAULT 0,
     pkts_down   INTEGER NOT NULL DEFAULT 0,
     flows       INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (bucket, local_ip, remote_ip, port, proto)
+    app         TEXT    NOT NULL DEFAULT '',  -- process/container from an agent, '' if unknown
+    PRIMARY KEY (bucket, local_ip, remote_ip, port, proto, app)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS traffic_country ON traffic(country, bucket);
 CREATE INDEX IF NOT EXISTS traffic_local ON traffic(local_ip, bucket);
@@ -70,10 +71,12 @@ class Classifier:
 
 
 class Store:
-    def __init__(self, path, geo, classifier, bucket_seconds=60, retention_days=30):
+    def __init__(self, path, geo, classifier, bucket_seconds=60, retention_days=30,
+                 attribution=None):
         self.path = path
         self.geo = geo
         self.cls = classifier
+        self.attribution = attribution
         self.bucket_seconds = bucket_seconds
         self.retention_days = retention_days
         self._local = threading.local()
@@ -84,7 +87,27 @@ class Store:
         self.stats = {"stored_flows": 0, "unclassified_flows": 0,
                       "ignored_flows": 0, "last_flow": 0}
         db = self.db()
+        self._migrate(db)
         db.executescript(SCHEMA)
+        db.commit()
+
+    @staticmethod
+    def _migrate(db):
+        """Databases from before app attribution: add the app column to the key."""
+        cols = [r[1] for r in db.execute("PRAGMA table_info(traffic)")]
+        if not cols or "app" in cols:
+            return
+        log.info("upgrading database: adding app column (one-off, may take a moment)")
+        db.execute("DROP INDEX IF EXISTS traffic_country")
+        db.execute("DROP INDEX IF EXISTS traffic_local")
+        db.execute("ALTER TABLE traffic RENAME TO traffic_old")
+        db.executescript(SCHEMA)
+        db.execute("""INSERT INTO traffic (bucket, local_ip, remote_ip, port, proto, country, asn,
+                          bytes_up, bytes_down, pkts_up, pkts_down, flows, app)
+                      SELECT bucket, local_ip, remote_ip, port, proto, country, asn,
+                          bytes_up, bytes_down, pkts_up, pkts_down, flows, ''
+                      FROM traffic_old""")
+        db.execute("DROP TABLE traffic_old")
         db.commit()
 
     def db(self):
@@ -102,9 +125,11 @@ class Store:
         now = int(now or time.time())
         bucket = now - now % self.bucket_seconds
         is_local = self.cls.is_local
+        attr = self.attribution
         with self._lock:
             for f in flows:
                 src, dst = f.src, f.dst
+                sport, dport = f.sport, f.dport
                 if self.cls.ignored(src) or self.cls.ignored(dst):
                     self.stats["ignored_flows"] += 1
                     continue
@@ -113,13 +138,17 @@ class Store:
                 if not sl and not dl:
                     if f.nat_dst and is_local(f.nat_dst):
                         dst, dl = f.nat_dst, True
+                        dport = f.nat_dport or dport
                     elif f.nat_src and is_local(f.nat_src):
                         src, sl = f.nat_src, True
+                        sport = f.nat_sport or sport
                 if sl:
                     local, remote, upload = src, dst, True
+                    lport, rport = sport, dport
                     mac = f.src_mac
                 elif dl:
                     local, remote, upload = dst, src, False
+                    lport, rport = dport, sport
                     # Download flows are usually recorded on the WAN port, where the
                     # destination MAC is the router's own, so never learn MACs from them.
                     mac = None
@@ -130,7 +159,8 @@ class Store:
                     port = min(f.sport, f.dport) if f.sport and f.dport else (f.sport or f.dport)
                 else:
                     port = 0
-                key = (bucket, local, remote, port, f.proto)
+                app = attr.lookup(local, f.proto, lport, remote, rport) if attr else ""
+                key = (bucket, local, remote, port, f.proto, app)
                 agg = self._pending.get(key)
                 if agg is None:
                     agg = self._pending[key] = [0, 0, 0, 0, 0]
@@ -154,19 +184,19 @@ class Store:
             return
         rows = []
         new_asns = []
-        for (bucket, local, remote, port, proto), (bu, bd, pu, pd, n) in pending.items():
+        for (bucket, local, remote, port, proto, app), (bu, bd, pu, pd, n) in pending.items():
             cc = self.geo.lookup_country(remote)
             asn, org = self.geo.lookup_asn(remote)
             if asn and asn not in self._asn_seen:
                 self._asn_seen[asn] = org
                 new_asns.append((asn, org))
-            rows.append((bucket, local, remote, port, proto, cc, asn, bu, bd, pu, pd, n))
+            rows.append((bucket, local, remote, port, proto, app, cc, asn, bu, bd, pu, pd, n))
         db = self.db()
         with db:
             db.executemany(
-                """INSERT INTO traffic (bucket, local_ip, remote_ip, port, proto, country,
+                """INSERT INTO traffic (bucket, local_ip, remote_ip, port, proto, app, country,
                        asn, bytes_up, bytes_down, pkts_up, pkts_down, flows)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT DO UPDATE SET
                        bytes_up = bytes_up + excluded.bytes_up,
                        bytes_down = bytes_down + excluded.bytes_down,

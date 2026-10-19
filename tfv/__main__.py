@@ -10,6 +10,7 @@ import threading
 import time
 import tomllib
 
+from .attribution import Attribution
 from .geo import Geo
 from .mikrotik import LeaseSync
 from .netflow import Decoder
@@ -30,6 +31,9 @@ DEFAULTS = {
         "ignore_networks": ["224.0.0.0/4", "255.255.255.255/32", "ff00::/8"],
     },
     "geoip": {"data_dir": DATA_DIR, "auto_download": True, "country_db": "", "asn_db": ""},
+    # Shared secret for agents that report which app owns each connection
+    # (tfv/agent.py). Agent reports are refused until this is set.
+    "agent": {"token": os.environ.get("TFV_AGENT_TOKEN", "")},
     "mikrotik": {"enabled": False, "url": "", "username": "", "password": "",
                  "verify_tls": True, "interval": 300},
 }
@@ -107,8 +111,9 @@ def main():
               g["auto_download"])
     geo.start()
     net = cfg["network"]
+    attribution = Attribution()
     store = Store(st["path"], geo, Classifier(net["local_networks"], net["ignore_networks"]),
-                  st["bucket_seconds"], st["retention_days"])
+                  st["bucket_seconds"], st["retention_days"], attribution)
     decoder = Decoder()
     c = cfg["collector"]
     collector = Collector(c["listen"], c["port"], decoder, store)
@@ -124,7 +129,8 @@ def main():
     threading.Thread(target=housekeeping, args=(store, decoder), daemon=True,
                      name="housekeeping").start()
     w = cfg["web"]
-    app = App(store, decoder, collector, geo, lease_sync, w.get("username"), w.get("password"))
+    app = App(store, decoder, collector, geo, lease_sync, w.get("username"), w.get("password"),
+              attribution, cfg["agent"].get("token") or os.environ.get("TFV_AGENT_TOKEN", ""))
     # As PID 1 in a container we get SIGTERM on `docker stop` (and on every
     # automatic update); exit promptly and save the last few seconds of flows.
     def on_term(*_):
