@@ -348,7 +348,14 @@ class Agent:
             except Exception as e:  # noqa: BLE001 - viewer restarts, network blips
                 failures += 1
                 if failures in (1, 10) or failures % 100 == 0:
-                    log.warning("report failed (%s); retrying", e)
+                    hint = ""
+                    if getattr(e, "code", None) == 401:
+                        hint = " - TFV_AGENT_TOKEN differs between the agent and the viewer"
+                    elif getattr(e, "code", None) == 403:
+                        hint = " - the viewer has no TFV_AGENT_TOKEN set"
+                    elif isinstance(getattr(e, "reason", e), (ConnectionRefusedError, TimeoutError, OSError)):
+                        hint = f" - can't reach the viewer at {self.url}; set TFV_URL to its LAN address"
+                    log.warning("report failed (%s)%s; retrying", e, hint)
             time.sleep(max(0.0, MIN_ROUND - (time.time() - started)))
 
 

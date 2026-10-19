@@ -94,6 +94,7 @@ class App:
                       (self.store.path, self.store.path + "-wal") if os.path.exists(p))
         return {
             "uptime": int(time.time() - self.started),
+            "version": os.environ.get("TFV_VERSION", "dev")[:12],
             "collector": {**self.collector.info(), **self.decoder.stats,
                           "templates": len(self.decoder.templates)},
             "store": {**self.store.stats, "db_bytes": db_size,
@@ -204,10 +205,13 @@ def make_handler(app):
         def _agent_report(self):
             """Connection owners from an agent. Uses its own shared token (not the UI login)."""
             token = self.headers.get("X-Agent-Token", "")
+            sender = self.client_address[0]
             if not app.agent_token:
+                app.attribution.reject(sender, "the viewer has no TFV_AGENT_TOKEN set")
                 return self._send(403, {"error": "agent reports are off: set TFV_AGENT_TOKEN on the viewer"})
             if not hmac.compare_digest(token, app.agent_token):
-                return self._send(401, {"error": "bad agent token"})
+                app.attribution.reject(sender, "wrong token" if token else "no token sent")
+                return self._send(401, {"error": "agent token doesn't match the viewer's TFV_AGENT_TOKEN"})
             length = int(self.headers.get("Content-Length") or 0)
             if length > 20_000_000:
                 return self._send(413, {"error": "too large"})

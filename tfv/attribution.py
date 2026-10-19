@@ -22,6 +22,7 @@ class Attribution:
         self.hosts = set()   # local IPs that have an agent, to skip lookups for the rest
         self.agents = {}     # agent name -> {"last", "exact", "bound", "ips"}
         self.stats = {"matched": 0, "unmatched": 0}
+        self.rejected = {}   # sender address -> {"reason", "count", "last"}, to show in Status
         self._pruned = time.time()
 
     def report(self, agent, exact, bound, ips):
@@ -63,7 +64,14 @@ class Attribution:
         self.stats["unmatched"] += 1
         return ""
 
+    def reject(self, sender, reason):
+        with self.lock:
+            r = self.rejected.setdefault(sender, {"count": 0})
+            r.update(reason=reason, last=int(time.time()))
+            r["count"] += 1
+
     def info(self):
         with self.lock:
             return {"agents": {k: dict(v) for k, v in self.agents.items()},
+                    "rejected": {k: dict(v) for k, v in self.rejected.items()},
                     "entries": len(self.exact) + len(self.bound), **self.stats}

@@ -10,7 +10,10 @@ WORKDIR /app
 COPY tfv/ /app/tfv/
 COPY tools/ /app/tools/
 
-ENV PYTHONUNBUFFERED=1 \
+# commit the image was built from (set by CI), shown in the Status tab
+ARG TFV_VERSION=dev
+ENV TFV_VERSION=$TFV_VERSION \
+    PYTHONUNBUFFERED=1 \
     TFV_DATA_DIR=/data \
     TFV_CONFIG=/data/config.toml
 

@@ -932,6 +932,7 @@ const TABS = {
           "Resolution": s.store.bucket_seconds + " s",
           "Retention": s.store.retention_days + " days",
           "Uptime": Math.round(s.uptime / 60) + " min",
+          "Version": esc(s.version || "?"),
         })}</div>
       <div><h3>GeoIP</h3>${dl({ "Country DB": esc(s.geo.country), "ASN DB": esc(s.geo.asn) })}
         <p class="muted"><a href="https://db-ip.com" target="_blank" rel="noopener" style="color:inherit">IP Geolocation by DB-IP</a> (CC BY 4.0)</p>
@@ -964,10 +965,12 @@ const TABS = {
 function agentStatus(a) {
   if (!a) return '<p class="muted">Unavailable.</p>';
   const names = Object.entries(a.agents);
-  if (!names.length) return `<p class="muted">${a.token_set ? "Token set; no agent has reported yet." : "Off: set <code>TFV_AGENT_TOKEN</code> to accept agent reports."}</p>`;
+  const rejected = Object.entries(a.rejected || {}).map(([ip, r]) =>
+    `<dt>Rejected</dt><dd>${esc(ip)}: ${esc(r.reason)} (${fmtNum(r.count)}×, last ${fmtAgo(r.last)})</dd>`).join("");
+  if (!names.length) return `<p class="muted">${a.token_set ? "Token set; no agent has reported yet." : "Off: set <code>TFV_AGENT_TOKEN</code> to accept agent reports."}</p>${rejected ? `<dl>${rejected}</dl>` : ""}`;
   const rate = a.matched + a.unmatched ? fmtPct(a.matched / (a.matched + a.unmatched)) : "—";
   return `<dl>${names.map(([n, x]) => `<dt>${esc(n)}</dt><dd>${esc((x.ips || []).join(", ") || "no addresses yet")}, last report ${fmtAgo(x.last)}</dd>`).join("")}
-    <dt>Flows matched</dt><dd>${rate} of flows from covered hosts</dd></dl>`;
+    <dt>Flows matched</dt><dd>${rate} of flows from covered hosts</dd>${rejected}</dl>`;
 }
 
 async function loadRdns(ips, root = document) {
