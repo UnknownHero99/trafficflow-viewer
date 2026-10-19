@@ -258,3 +258,49 @@ class LocalTrafficTest(unittest.TestCase):
             row = st.db().execute("""SELECT bytes_up, bytes_down FROM traffic
                                      WHERE local_ip = '192.168.1.102'""").fetchone()
             self.assertEqual(tuple(row), (0, 900000))
+
+
+class Ipv6MergeTest(unittest.TestCase):
+    def test_eui64(self):
+        from tfv.store import eui64_mac
+        self.assertEqual(eui64_mac("fe80::9e13:9eff:fe0a:4683"), "9c:13:9e:0a:46:83")
+        self.assertIsNone(eui64_mac("fd12:3456:789a:1:8a55:c3c0:37fb:ae10"))  # privacy address
+        self.assertIsNone(eui64_mac("192.168.1.1"))
+
+    def test_ipv6_filed_under_device(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fakeflow.write_demo_geo(tmp)
+            geo = Geo(tmp, auto_download=False)
+            geo.start()
+            path = os.path.join(tmp, "db.sqlite")
+            st = Store(path, geo, Classifier(["192.168.0.0/16", "fc00::/7", "fe80::/10"]))
+
+            def flow(src, dst, nbytes, src_mac=None):
+                f = Flow()
+                f.src, f.dst, f.sport, f.dport, f.proto = src, dst, 50000, 443, 6
+                f.bytes, f.packets, f.src_mac = nbytes, 1, src_mac
+                return f
+
+            mac = "bc:a8:a6:bb:10:61"
+            st.add_flows([
+                flow("192.168.1.54", "142.250.1.1", 100, mac),                 # learns the device's MAC
+                flow("fd12:3456:789a:1:8a55:c3c0:37fb:ae10", "fd12:3456:789a:10::5", 50, mac),  # privacy addr
+                flow("fe80::9e13:9eff:fe0a:4683", "fe80::1", 7),               # EUI-64, no IPv4 twin yet
+            ], now=1_000_000)
+            st.flush()
+            devs = {r["ip"]: r for r in queries.summary(st.db(), {"from": "999000", "to": "1001000"}, 60)["devices"]}
+            self.assertEqual(devs["192.168.1.54"]["up"], 150)
+            self.assertNotIn("fd12:3456:789a:1:8a55:c3c0:37fb:ae10", devs)
+            self.assertIn("fe80::9e13:9eff:fe0a:4683", devs)
+
+            # later the Thread Border Router's IPv4 address shows up with that MAC; on the
+            # next start its old IPv6 history is merged into it (once)
+            st.add_flows([flow("192.168.10.20", "142.250.1.1", 10, "9c:13:9e:0a:46:83")], now=1_000_000)
+            st.flush()
+            db = st.db()
+            db.execute("PRAGMA user_version = 2")
+            db.commit()
+            st = Store(path, geo, Classifier(["192.168.0.0/16", "fc00::/7", "fe80::/10"]))
+            devs = {r["ip"]: r for r in queries.summary(st.db(), {"from": "999000", "to": "1001000"}, 60)["devices"]}
+            self.assertEqual(devs["192.168.10.20"]["up"], 17)
+            self.assertNotIn("fe80::9e13:9eff:fe0a:4683", devs)

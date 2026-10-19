@@ -9,6 +9,20 @@ import time
 
 log = logging.getLogger("tfv.store")
 
+
+def eui64_mac(ip):
+    """MAC address embedded in an IPv6 address built from it (…:xxff:fexx:…), or None."""
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return None
+    if a.version != 6:
+        return None
+    b = a.packed[8:]
+    if b[3:5] != b"\xff\xfe":
+        return None
+    return ":".join(f"{x:02x}" for x in bytes([b[0] ^ 2]) + b[1:3] + b[5:8])
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS traffic (
     bucket      INTEGER NOT NULL,  -- unix time, start of bucket
@@ -82,6 +96,10 @@ class Store:
         self._local = threading.local()
         self._pending = {}
         self._devices_seen = {}   # ip -> (mac, last_seen)
+        # A device has one IPv4 address but several IPv6 ones; IPv6 traffic is filed
+        # under the IPv4 address of the device with the same MAC.
+        self._mac_v4 = {}         # mac -> IPv4 address
+        self._v6_mac = {}         # IPv6 address -> mac
         self._asn_seen = {}
         self._lock = threading.Lock()
         self.stats = {"stored_flows": 0, "unclassified_flows": 0,
@@ -91,6 +109,72 @@ class Store:
         db.executescript(SCHEMA)
         db.commit()
         self._backfill_lan(db)
+        for ip, mac in db.execute("SELECT ip, mac FROM devices WHERE mac IS NOT NULL ORDER BY last_seen"):
+            if ":" in ip:
+                self._v6_mac[ip] = mac.lower()
+            else:
+                self._mac_v4[mac.lower()] = ip
+        self._merge_ipv6(db)
+
+    def device_ip(self, ip, mac=None):
+        """The address to file a local address's traffic under (IPv6 -> owner's IPv4)."""
+        if ":" not in ip:
+            if mac:
+                self._mac_v4[mac.lower()] = ip
+            return ip
+        mac = (mac or self._v6_mac.get(ip) or eui64_mac(ip) or "").lower()
+        if not mac:
+            return ip
+        if len(self._v6_mac) > 50000:
+            self._v6_mac.clear()
+        self._v6_mac[ip] = mac
+        return self._mac_v4.get(mac, ip)
+
+    def _merge_ipv6(self, db):
+        """Version 3: move history stored under IPv6 addresses to the owning device."""
+        if db.execute("PRAGMA user_version").fetchone()[0] >= 3:
+            return
+        moves = {}
+        for (ip,) in db.execute("SELECT DISTINCT local_ip FROM traffic WHERE local_ip LIKE '%:%'"):
+            target = self.device_ip(ip)
+            if target != ip:
+                moves[ip] = target
+        if moves:
+            log.info("merging %d IPv6 addresses into their devices (one-off)", len(moves))
+            for old, new in moves.items():
+                db.execute(
+                    """INSERT INTO traffic (bucket, local_ip, remote_ip, port, proto, app, country, asn,
+                           bytes_up, bytes_down, pkts_up, pkts_down, flows)
+                       SELECT bucket, ?, remote_ip, port, proto, app, country, asn,
+                           bytes_up, bytes_down, pkts_up, pkts_down, flows
+                       FROM traffic WHERE local_ip = ?
+                       ON CONFLICT DO UPDATE SET
+                           bytes_up = bytes_up + excluded.bytes_up,
+                           bytes_down = bytes_down + excluded.bytes_down,
+                           pkts_up = pkts_up + excluded.pkts_up,
+                           pkts_down = pkts_down + excluded.pkts_down,
+                           flows = flows + excluded.flows""", (new, old))
+                db.execute("DELETE FROM traffic WHERE local_ip = ?", (old,))
+                # the other end of local traffic
+                db.execute(
+                    """INSERT INTO traffic (bucket, local_ip, remote_ip, port, proto, app, country, asn,
+                           bytes_up, bytes_down, pkts_up, pkts_down, flows)
+                       SELECT bucket, local_ip, ?, port, proto, app, country, asn,
+                           bytes_up, bytes_down, pkts_up, pkts_down, flows
+                       FROM traffic WHERE remote_ip = ?
+                       ON CONFLICT DO UPDATE SET
+                           bytes_up = bytes_up + excluded.bytes_up,
+                           bytes_down = bytes_down + excluded.bytes_down,
+                           pkts_up = pkts_up + excluded.pkts_up,
+                           pkts_down = pkts_down + excluded.pkts_down,
+                           flows = flows + excluded.flows""", (new, old))
+                db.execute("DELETE FROM traffic WHERE remote_ip = ?", (old,))
+                # keep a name typed for the IPv6 address only if the device has none
+                db.execute("""UPDATE devices SET name = (SELECT name FROM devices WHERE ip = ?)
+                              WHERE ip = ? AND name IS NULL""", (old, new))
+                db.execute("DELETE FROM devices WHERE ip = ?", (old,))
+        db.execute("PRAGMA user_version = 3")
+        db.commit()
 
     def _backfill_lan(self, db):
         """Before version 2, traffic between two of your devices was stored only as the
@@ -196,7 +280,13 @@ class Store:
                 else:
                     port = 0
                 for local, remote, lport, rport, upload, mac in sides:
+                    # agents report the real (IPv6) address, so look the app up first
                     app = attr.lookup(local, f.proto, lport, remote, rport) if attr else ""
+                    addr = self.device_ip(local, mac)
+                    if addr != local:
+                        local, mac = addr, None  # filed under the device's IPv4 address
+                    if ":" in remote and is_local(remote):
+                        remote = self.device_ip(remote)
                     key = (bucket, local, remote, port, f.proto, app)
                     agg = self._pending.get(key)
                     if agg is None:
