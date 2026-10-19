@@ -27,6 +27,7 @@ import struct
 import subprocess
 import threading
 import time
+import urllib.parse
 import urllib.request
 
 from .attribution import clean_token, token_fingerprint
@@ -37,6 +38,8 @@ PROTOS = {"tcp": 6, "udp": 17}
 RESEND = 60          # re-send unchanged entries this often so the viewer keeps them
 DOCKER_REFRESH = 30  # seconds between container list refreshes
 NAT_INTERVAL = 2     # seconds between NAT table reads (entries outlive their connection)
+# printable ASCII except "%": plain tokens are sent unchanged (older viewers compare as-is)
+_TOKEN_SAFE = "".join(chr(c) for c in range(33, 127) if chr(c) != "%")
 MIN_ROUND = 0.1      # at most 10 rounds per second, however many connections start
 
 
@@ -113,7 +116,9 @@ def _hex_ip(h):
     if len(b) == 4:
         return str(ipaddress.IPv4Address(struct.pack("<I", struct.unpack(">I", b)[0])))
     words = struct.unpack(">4I", b)
-    return str(ipaddress.IPv6Address(b"".join(struct.pack("<I", w) for w in words)))
+    a = ipaddress.IPv6Address(b"".join(struct.pack("<I", w) for w in words))
+    # dual-stack sockets show IPv4 peers as ::ffff:a.b.c.d; the router reports a.b.c.d
+    return str(a.ipv4_mapped or a)
 
 
 def proc_sockets(proc="/proc"):
@@ -304,7 +309,9 @@ class Agent:
             body = json.dumps({"agent": self.name, "ips": sorted(host_ips),
                                "exact": new_exact, "bound": new_bound}).encode()
             req = urllib.request.Request(self.url, data=body, method="POST", headers={
-                "Content-Type": "application/json", "X-Agent-Token": self.token})
+                "Content-Type": "application/json",
+                # HTTP headers are Latin-1 only; percent-encode so any token works (č, š, ž…)
+                "X-Agent-Token": urllib.parse.quote(self.token, safe=_TOKEN_SAFE)})
             with urllib.request.urlopen(req, timeout=10) as r:
                 r.read()
             for e in new_exact + new_bound:

@@ -249,19 +249,16 @@ class Store:
                     self.stats["ignored_flows"] += 1
                     continue
                 sl, dl = is_local(src), is_local(dst)
-                # Use post-NAT addresses to find the LAN host if needed.
-                if not sl and not dl:
-                    if f.nat_dst and is_local(f.nat_dst):
-                        dst, dl = f.nat_dst, True
-                        dport = f.nat_dport or dport
-                    elif f.nat_src and is_local(f.nat_src):
-                        src, sl = f.nat_src, True
-                        sport = f.nat_sport or sport
-                # A device reaching another one through the router's public address
-                # (hairpin NAT) is local traffic too.
-                if sl and not dl and f.nat_dst and is_local(f.nat_dst):
+                # The router reports addresses as the packet arrived, so the post-NAT
+                # destination is who really receives it: a LAN device behind the WAN
+                # address, a port-forward target, or with hairpin NAT (a device using
+                # your public domain) the device behind the router's own LAN address.
+                if f.nat_dst and f.nat_dst != dst and is_local(f.nat_dst):
                     dst, dl = f.nat_dst, True
                     dport = f.nat_dport or dport
+                elif not sl and not dl and f.nat_src and is_local(f.nat_src):
+                    src, sl = f.nat_src, True
+                    sport = f.nat_sport or sport
                 # Each side that is one of ours gets its own row: the sender as upload,
                 # the receiver as download. Traffic between two of your devices (e.g. a
                 # Jellyfin server streaming to a TV) therefore shows on both of them.
@@ -275,8 +272,8 @@ class Store:
                 if not sides:
                     self.stats["unclassified_flows"] += 1
                     continue
-                if f.proto in (6, 17, 132):
-                    port = min(f.sport, f.dport) if f.sport and f.dport else (f.sport or f.dport)
+                if f.proto in (6, 17, 132):  # service port, from the (post-NAT) ports
+                    port = min(sport, dport) if sport and dport else (sport or dport)
                 else:
                     port = 0
                 for local, remote, lport, rport, upload, mac in sides:

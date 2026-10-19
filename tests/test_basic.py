@@ -314,3 +314,48 @@ class TokenTest(unittest.TestCase):
         self.assertEqual(token_fingerprint("abc123"), token_fingerprint(clean_token('"abc123"')))
         self.assertEqual(len(token_fingerprint("abc123")), 8)
         self.assertEqual(token_fingerprint(""), "")
+
+
+class HairpinAndAgentFixesTest(unittest.TestCase):
+    def test_hairpin_nat_credits_real_device(self):
+        """Records as a MikroTik reports them when a device (192.168.1.57) watches
+        Jellyfin through the public domain, proxied by the server on :9443."""
+        with tempfile.TemporaryDirectory() as tmp:
+            fakeflow.write_demo_geo(tmp)
+            geo = Geo(tmp, auto_download=False)
+            geo.start()
+            st = Store(os.path.join(tmp, "db.sqlite"), geo, Classifier(["192.168.0.0/16"]))
+            req, rep = Flow(), Flow()
+            # device -> public IP:443, forwarded to the server's :9443
+            req.src, req.sport, req.dst, req.dport, req.proto, req.bytes, req.packets = \
+                "192.168.1.57", 40752, "213.143.93.247", 443, 6, 2_000, 20
+            req.nat_src, req.nat_dst, req.nat_sport, req.nat_dport = "192.168.10.1", "192.168.10.10", 40752, 9443
+            # server -> router's LAN address (masquerade); post-NAT destination is the device
+            rep.src, rep.sport, rep.dst, rep.dport, rep.proto, rep.bytes, rep.packets = \
+                "192.168.10.10", 9443, "192.168.10.1", 40752, 6, 5_000_000, 3500
+            rep.nat_src, rep.nat_dst, rep.nat_sport, rep.nat_dport = "213.143.93.247", "192.168.1.57", 443, 40752
+            st.add_flows([req, rep], now=1_000_000)
+            st.flush()
+            s = queries.summary(st.db(), {"from": "999000", "to": "1001000"}, 60)
+            dev = {r["ip"]: (r["up"], r["down"]) for r in s["devices"]}
+            self.assertEqual(dev["192.168.1.57"], (2_000, 5_000_000))
+            self.assertEqual(dev["192.168.10.10"], (5_000_000, 2_000))
+            self.assertNotIn("192.168.10.1", dev)
+            self.assertEqual({r["port"] for r in s["ports"]}, {9443})
+
+    def test_ipv4_mapped_socket_addresses(self):
+        import ipaddress
+        import struct
+        from tfv.agent import _hex_ip
+        packed = ipaddress.IPv6Address("::ffff:192.168.10.10").packed
+        hexed = "".join(struct.pack("<I", w).hex() for w in struct.unpack(">4I", packed))
+        self.assertEqual(_hex_ip(hexed.upper()), "192.168.10.10")
+
+    def test_non_ascii_token_header(self):
+        import hmac, urllib.parse
+        from tfv.agent import _TOKEN_SAFE
+        token = "geslo-Čmrlj-žaba"
+        header = urllib.parse.quote(token, safe=_TOKEN_SAFE)
+        header.encode("latin-1")  # must be sendable as an HTTP header
+        self.assertTrue(hmac.compare_digest(urllib.parse.unquote(header).encode(), token.encode()))
+        self.assertEqual(urllib.parse.quote("abc-DEF_123", safe=_TOKEN_SAFE), "abc-DEF_123")  # plain tokens unchanged

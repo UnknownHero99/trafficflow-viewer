@@ -206,12 +206,12 @@ def make_handler(app):
 
         def _agent_report(self):
             """Connection owners from an agent. Uses its own shared token (not the UI login)."""
-            token = clean_token(self.headers.get("X-Agent-Token", ""))
+            token = clean_token(urllib.parse.unquote(self.headers.get("X-Agent-Token", "")))
             sender = self.client_address[0]
             if not app.agent_token:
                 app.attribution.reject(sender, "the viewer has no TFV_AGENT_TOKEN set")
                 return self._send(403, {"error": "agent reports are off: set TFV_AGENT_TOKEN on the viewer"})
-            if not hmac.compare_digest(token, app.agent_token):
+            if not hmac.compare_digest(token.encode(), app.agent_token.encode()):
                 app.attribution.reject(sender, f"wrong token (agent's fingerprint {token_fingerprint(token)})"
                                        if token else "no token sent")
                 return self._send(401, {"error": "agent token doesn't match the viewer's TFV_AGENT_TOKEN"})
