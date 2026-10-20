@@ -16,6 +16,9 @@ It collects flows from your router and shows where your traffic goes:
 - **Country heatmap**: countries × time grid, showing when each country is busy. Click a
   cell to zoom the whole dashboard into that time.
 - **Apps**: which program or container on your servers caused the traffic (optional agent).
+- **Domains**: which of your reverse proxy's domains each visitor used, and how much (optional agent).
+- **Alerts**: new devices, devices that should stay off the internet using it, unusual traffic
+  bursts, a silent router or a failing agent. Shown in the app only.
 - **My devices**, **Organisations (ASN)**, **Remote hosts** (with reverse DNS), **Services**.
 - **Connections**: device ↔ host ↔ port, sortable, paged, **CSV export**.
 - **Status**: collector counters, plus the most recent raw flow records for troubleshooting.
@@ -161,6 +164,13 @@ It reads:
 
 Only traffic recorded while the agent runs gets an app; older data stays *Not attributed*.
 
+The agent also records **which domain visitors ask your reverse proxy for**: the server name in
+the TLS handshake (sent unencrypted) or the HTTP `Host` header. It only reads the first bytes of
+new connections to the server's own ports 80, 443, 8080, 8443, 9080 and 9443 (change with
+`TFV_AGENT_PROXY_PORTS`, or `off`); a kernel filter drops everything else, so streams through the
+proxy cost nothing. This works through hairpin NAT too (a device at home using your public
+domain), and shows up in the **Domains** tab and in device and host details.
+
 **On the server that runs the viewer**, add to `.env` (the token is any long random string,
 e.g. from `openssl rand -hex 24`):
 
@@ -182,9 +192,25 @@ docker compose up -d agent
 ```
 
 The agent needs broad access to that server: host network and processes, `NET_ADMIN` (NAT
-table), `SYS_PTRACE` (which process owns a socket), no AppArmor confinement, and the Docker
-socket. Only run it on servers you control. The Status tab shows each agent, the addresses
+table), `SYS_PTRACE` (which process owns a socket), `NET_RAW` (proxy domains), no AppArmor
+confinement, and the Docker socket. Only run it on servers you control. The Status tab shows each agent, the addresses
 it covers and how many flows get matched.
+
+## Alerts
+
+The **Alerts** tab (and the counter next to the status label) shows, checked every minute:
+
+- **No flows from the router** for 10 minutes.
+- **Agent problems**: an agent stopped reporting, or its reports are refused (with the reason).
+- **New devices**: a device with a new MAC address showed up in the last 24 hours.
+- **Internet use by devices that shouldn't**: tick *Should not use the internet* in a device's
+  detail panel, or list whole networks in `TFV_NO_INTERNET_NETWORKS` (e.g. `192.168.40.0/24`
+  for cameras). Any internet traffic from them raises an alert, with where it went.
+- **Traffic bursts**: a device moved over 500 MB in the last hour, and over 3× its busiest hour
+  of the past week (so daily habits like evening streaming don't count).
+
+*Dismiss* hides an alert until something new happens (e.g. the same device using the internet
+again on another day).
 
 ## Configuration
 

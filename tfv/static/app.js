@@ -71,6 +71,7 @@ const DIMS = {
   country: { label: "Country", plural: "Countries" },
   device: { label: "Device", plural: "My devices" },
   app: { label: "App", plural: "Apps" },
+  domain: { label: "Domain", plural: "Domains" },
   asn: { label: "Organisation", plural: "Organisations" },
   remote: { label: "Remote host", plural: "Remote hosts" },
   port: { label: "Service port", plural: "Services" },
@@ -89,6 +90,7 @@ function textLabel(dim, v) {
     case "port": return +v === 0 ? "no port" : v + (SERVICES[v] ? " " + SERVICES[v] : "");
     case "proto": return PROTOS[v] || "proto " + v;
     case "app": return v || "Not attributed";
+    case "domain": return v || "No domain";
     default: return String(v);
   }
 }
@@ -97,6 +99,7 @@ function htmlLabel(dim, v) {
   if (dim === "country") return `<span class="flag">${flag(v)}</span>${esc(countryName(v))}`;
   if (dim === "remote") return `<span class="mono">${esc(v)}</span>`;
   if (dim === "app" && !v) return `<span class="muted">Not attributed</span>`;
+  if (dim === "domain" && !v) return `<span class="muted">No domain</span>`;
   return esc(textLabel(dim, v));
 }
 
@@ -110,7 +113,7 @@ const state = {
   hideIdle: true,
   heatMetric: "total",
 };
-let summary = null, status = null, devicesData = null;
+let summary = null, status = null, devicesData = null, alertsData = [];
 
 function readHash() {
   const p = new URLSearchParams(location.hash.slice(1));
@@ -361,6 +364,23 @@ function renderStatusPill() {
     color = "var(--critical)"; icon = "▲"; text = "No flows since " + fmtAgo(last);
   }
   el.innerHTML = `<span style="color:${color}">${icon}</span>${esc(text)}`;
+}
+
+// ---------- alerts ----------
+const ALERT_ICON = { critical: "▲", warning: "⚠", info: "●" };
+function renderAlertPill() {
+  const el = $("#alert-pill");
+  el.hidden = !alertsData.length;
+  if (!alertsData.length) return;
+  const top = alertsData[0].level;
+  el.className = `pill alert-pill ${top}`;
+  el.innerHTML = `<span>${ALERT_ICON[top]}</span>${alertsData.length} alert${alertsData.length > 1 ? "s" : ""}`;
+}
+async function ackAlerts(keys) {
+  await api("/api/alerts/ack", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ keys }) });
+  alertsData = alertsData.filter((a) => !keys.includes(a.key));
+  renderAlertPill();
+  if (state.tab === "alerts") renderPanel();
 }
 
 // ---------- bar chart (main chart and drawer chart) ----------
@@ -821,6 +841,24 @@ const TABS = {
     return el;
   },
 
+  domains() {
+    const el = document.createElement("div");
+    el.innerHTML = `<div class="panel-bar"><span>${summary.domains.length
+      ? "Domains visitors asked your reverse proxy for, as seen by your server: ↑ sent to visitors, ↓ received from them. Click one to see who used it."
+      : "No domains yet. The agent on your server reads them from new connections to your reverse proxy (needs <code>NET_RAW</code>; see README: <i>Which app caused it</i>)."}</span></div>`;
+    el.appendChild(table("domains", [
+      { key: "domain", label: "Domain", render: (r) => esc(r.domain) },
+      { key: "apps", label: "Served by", sortable: false, render: (r) => esc(r.apps.join(", ")) },
+      { key: "remotes", label: "Visitors", num: true, title: "Distinct addresses that used it", render: (r) => fmtNum(r.remotes) },
+      { key: "countries", label: "Countries", num: true, render: (r) => fmtNum(r.countries) },
+      { key: "up", label: "↑ Sent", num: true, render: (r) => fmtBytes(r.up) },
+      { key: "down", label: "↓ Received", num: true, render: (r) => fmtBytes(r.down) },
+      trafficCols[2],
+      { key: "flows", label: "Flows", num: true, render: (r) => fmtNum(r.flows) },
+    ], summary.domains, { dim: "domain", id: (r) => r.domain, empty: "No domains in this time range." }));
+    return el;
+  },
+
   orgs() {
     for (const r of summary.orgs) labels.asn[r.asn] = r.org || "AS" + r.asn;
     return table("orgs", [
@@ -868,7 +906,7 @@ const TABS = {
       <button class="btn" id="next" ${c.offset + c.limit < data.count ? "" : "disabled"}>Next →</button>
       <a class="btn" href="${csv}">Export CSV</a></div>`;
     const cols = [
-      ["name", "Device"], ["app", "App"], ["remote", "Remote host"], ["country", "Country"], ["org", "Organisation"],
+      ["name", "Device"], ["app", "App"], ["domain", "Domain"], ["remote", "Remote host"], ["country", "Country"], ["org", "Organisation"],
       ["port", "Port", true], ["down", "↓ Download", true], ["up", "↑ Upload", true],
       ["flows", "Flows", true], ["last", "Last seen", true],
     ];
@@ -884,6 +922,7 @@ const TABS = {
       if (r.name) labels.device[r.local] = r.name;
       h += `<tr><td>${open("device", r.local, `${esc(r.name || "")} <span class="mono muted">${esc(r.local)}</span>`)}</td>
         <td>${r.app ? open("app", r.app, esc(r.app)) : ""}</td>
+        <td>${r.domain ? open("domain", r.domain, esc(r.domain)) : ""}</td>
         <td class="mono">${open("remote", r.remote, esc(r.remote))}</td>
         <td>${open("country", r.cc, countryCell(r.cc))}</td>
         <td>${r.asn ? open("asn", r.asn, esc(r.org || "AS" + r.asn)) : ""}</td>
@@ -896,11 +935,34 @@ const TABS = {
     el.querySelectorAll("th[data-sort]").forEach((th) => th.onclick = () => {
       const k = th.dataset.sort;
       if (c.sort === k) c.dir = c.dir === "asc" ? "desc" : "asc";
-      else { c.sort = k; c.dir = ["name", "app", "remote", "country", "org"].includes(k) ? "asc" : "desc"; }
+      else { c.sort = k; c.dir = ["name", "app", "domain", "remote", "country", "org"].includes(k) ? "asc" : "desc"; }
       c.offset = 0; renderPanel();
     });
     $("#prev", el).onclick = () => { c.offset = Math.max(0, c.offset - c.limit); renderPanel(); };
     $("#next", el).onclick = () => { c.offset += c.limit; renderPanel(); };
+    return el;
+  },
+
+  alerts() {
+    const el = document.createElement("div");
+    if (!alertsData.length) {
+      el.innerHTML = `<div class="empty-state">No alerts. Checked every minute: router silent, agents failing, new devices,
+        devices marked “should not use the internet” (or on <code>TFV_NO_INTERNET_NETWORKS</code>) using it, and traffic spikes.</div>`;
+      return el;
+    }
+    el.innerHTML = `<div class="panel-bar"><span>${alertsData.length} alert${alertsData.length > 1 ? "s" : ""}. Dismissed alerts come back only if something new happens.</span>
+      <span class="grow"></span><button class="btn" id="ack-all">Dismiss all</button></div>
+      <div class="alert-list">${alertsData.map((a, i) => `
+        <div class="alert-item ${a.level}">
+          <span class="alert-icon" aria-label="${a.level}">${ALERT_ICON[a.level]}</span>
+          <div class="alert-text"><b>${esc(a.title)}</b><div class="muted">${esc(a.detail)}</div>
+            <div class="muted small">${a.since ? fmtAgo(a.since) : ""}</div></div>
+          <div class="alert-actions">${a.device ? `<button class="btn" data-dev="${esc(a.device)}">Details</button>` : ""}
+            <button class="btn" data-ack="${i}">Dismiss</button></div>
+        </div>`).join("")}</div>`;
+    $("#ack-all", el).onclick = () => ackAlerts(alertsData.map((a) => a.key));
+    el.querySelectorAll("[data-ack]").forEach((b) => b.onclick = () => ackAlerts([alertsData[+b.dataset.ack].key]));
+    el.querySelectorAll("[data-dev]").forEach((b) => b.onclick = () => openDrawer("device", b.dataset.dev));
     return el;
   },
 
@@ -969,7 +1031,11 @@ function agentStatus(a) {
     `<dt>Rejected</dt><dd>${esc(ip)}: ${esc(r.reason)} (${fmtNum(r.count)}×, last ${fmtAgo(r.last)})</dd>`).join("");
   if (!names.length) return `<p class="muted">${a.token_set ? `Token set (fingerprint <span class="mono">${esc(a.token_fingerprint)}</span>); no agent has reported yet.` : "Off: set <code>TFV_AGENT_TOKEN</code> to accept agent reports."}</p>${rejected ? `<dl>${rejected}</dl>` : ""}`;
   const rate = a.matched + a.unmatched ? fmtPct(a.matched / (a.matched + a.unmatched)) : "—";
-  return `<dl>${names.map(([n, x]) => `<dt>${esc(n)}</dt><dd>${esc((x.ips || []).join(", ") || "no addresses yet")}, last report ${fmtAgo(x.last)}</dd>`).join("")}
+  const dom = (n) => {
+    const err = (a.domain_errors || {})[n];
+    return err == null ? "" : `<br><span class="muted">Proxy domains: ${err ? esc(err) : "on"}</span>`;
+  };
+  return `<dl>${names.map(([n, x]) => `<dt>${esc(n)}</dt><dd>${esc((x.ips || []).join(", ") || "no addresses yet")}, last report ${fmtAgo(x.last)}${dom(n)}</dd>`).join("")}
     <dt>Flows matched</dt><dd>${rate} of flows from covered hosts</dd>
     <dt>Token fingerprint</dt><dd class="mono">${esc(a.token_fingerprint || "—")}</dd>${rejected}</dl>`;
 }
@@ -988,10 +1054,11 @@ async function loadRdns(ips, root = document) {
 // What each kind of item shows when you open it: [dimension, summary key, id key].
 const DRILL = {
   country: [["device", "devices", "ip"], ["app", "apps", "app"], ["asn", "orgs", "asn"], ["remote", "remotes", "ip"], ["port", "ports", "port"]],
-  device: [["app", "apps", "app"], ["country", "countries", "cc"], ["asn", "orgs", "asn"], ["remote", "remotes", "ip"], ["port", "ports", "port"]],
-  app: [["device", "devices", "ip"], ["country", "countries", "cc"], ["asn", "orgs", "asn"], ["remote", "remotes", "ip"], ["port", "ports", "port"]],
+  device: [["app", "apps", "app"], ["domain", "domains", "domain"], ["country", "countries", "cc"], ["asn", "orgs", "asn"], ["remote", "remotes", "ip"], ["port", "ports", "port"]],
+  app: [["domain", "domains", "domain"], ["device", "devices", "ip"], ["country", "countries", "cc"], ["asn", "orgs", "asn"], ["remote", "remotes", "ip"], ["port", "ports", "port"]],
   asn: [["country", "countries", "cc"], ["device", "devices", "ip"], ["app", "apps", "app"], ["remote", "remotes", "ip"], ["port", "ports", "port"]],
-  remote: [["device", "devices", "ip"], ["app", "apps", "app"], ["port", "ports", "port"]],
+  remote: [["domain", "domains", "domain"], ["device", "devices", "ip"], ["app", "apps", "app"], ["port", "ports", "port"]],
+  domain: [["remote", "remotes", "ip"], ["device", "devices", "ip"], ["country", "countries", "cc"], ["asn", "orgs", "asn"], ["app", "apps", "app"]],
   port: [["country", "countries", "cc"], ["device", "devices", "ip"], ["app", "apps", "app"], ["asn", "orgs", "asn"], ["remote", "remotes", "ip"]],
   proto: [["country", "countries", "cc"], ["device", "devices", "ip"], ["port", "ports", "port"]],
 };
@@ -1032,9 +1099,12 @@ async function renderDrawer() {
   if (dim === "device") {
     const dev = (devicesData?.devices || []).find((x) => x.ip === id) || {};
     sub = `Device · <span class="mono">${esc(id)}</span>${dev.mac ? ` · <span class="mono">${esc(dev.mac)}</span>` : ""}`;
-    extra = `<button class="btn" id="drawer-rename">Rename</button>`;
+    extra = `<button class="btn" id="drawer-rename">Rename</button>
+      <label class="toggle" title="Raise an alert whenever this device talks to the internet">
+        <input type="checkbox" id="drawer-noinet" ${dev.no_internet ? "checked" : ""}> Should not use the internet</label>`;
   }
   if (dim === "asn") sub = +id ? `Organisation · AS${esc(id)}` : "Organisation";
+  if (dim === "domain") sub = `Domain on your reverse proxy · served by ${esc((data.apps || []).filter((a) => a.app).map((a) => a.app).join(", ") || "?")}`;
   if (dim === "app") sub = id ? `App · runs on ${esc(data.devices.map((d) => d.name || d.ip).join(", "))}` : "Traffic no agent could match to a program";
   if (dim === "remote") {
     const r = data.remotes[0] || {};
@@ -1068,6 +1138,7 @@ async function renderDrawer() {
   for (const [sdim, key, idKey] of DRILL[dim] || []) {
     const rows = (data[key] || []).filter((r) => String(r[idKey]) !== id);
     if (!rows.length || (sdim === "app" && !rows.some((r) => r.app))) continue;  // no agent data
+    if (sdim === "domain" && !rows.some((r) => r.domain)) continue;
     const max = Math.max(...rows.map(totalOf));
     h += `<h3>${DIMS[sdim].plural} <span class="muted">${rows.length > 8 ? "top 8 of " + rows.length : rows.length}</span></h3><div class="dlist">`;
     for (const r of rows.slice(0, 8)) {
@@ -1103,6 +1174,12 @@ async function renderDrawer() {
     refresh();
   };
   d.querySelectorAll(".ditem").forEach((b) => b.onclick = () => openDrawer(b.dataset.dim, b.dataset.id));
+  const ni = $("#drawer-noinet", d);
+  if (ni) ni.onchange = async () => {
+    await api("/api/devices", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ip: id, no_internet: ni.checked }) });
+    refresh();
+  };
   if (dim === "remote") loadRdns([id], d);
 }
 
@@ -1179,9 +1256,13 @@ async function refresh() {
   writeHash();
   try {
     const p = apiParams();
-    [summary, status, devicesData] = await Promise.all([
+    let alertsRes;
+    [summary, status, devicesData, alertsRes] = await Promise.all([
       api("/api/summary?" + p), api("/api/status"), api("/api/devices?" + p),
+      api("/api/alerts").catch(() => ({ alerts: [] })),
     ]);
+    alertsData = alertsRes.alerts || [];
+    renderAlertPill();
     for (const d of devicesData.devices) labels.device[d.ip] = d.name || d.ip;
     for (const r of summary.orgs) if (r.asn) labels.asn[r.asn] = r.org || "AS" + r.asn;
     renderChips();
@@ -1216,6 +1297,7 @@ function init() {
     refresh();
   });
   $("#add-filter").onclick = (e) => openPicker(e.currentTarget);
+  $("#alert-pill").onclick = () => { state.tab = "alerts"; renderPanel(); $("#tabs").scrollIntoView({ block: "nearest" }); };
   $("#lan").checked = state.lan;
   $("#lan").onchange = (e) => { state.lan = e.target.checked; refresh(); };
   $("#search").value = state.q;

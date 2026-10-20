@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS traffic (
     pkts_down   INTEGER NOT NULL DEFAULT 0,
     flows       INTEGER NOT NULL DEFAULT 0,
     app         TEXT    NOT NULL DEFAULT '',  -- process/container from an agent, '' if unknown
-    PRIMARY KEY (bucket, local_ip, remote_ip, port, proto, app)
+    domain      TEXT    NOT NULL DEFAULT '',  -- reverse-proxy domain asked for, '' if none
+    PRIMARY KEY (bucket, local_ip, remote_ip, port, proto, app, domain)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS traffic_country ON traffic(country, bucket);
 CREATE INDEX IF NOT EXISTS traffic_local ON traffic(local_ip, bucket);
@@ -143,9 +144,9 @@ class Store:
             log.info("merging %d IPv6 addresses into their devices (one-off)", len(moves))
             for old, new in moves.items():
                 db.execute(
-                    """INSERT INTO traffic (bucket, local_ip, remote_ip, port, proto, app, country, asn,
+                    """INSERT INTO traffic (bucket, local_ip, remote_ip, port, proto, app, domain, country, asn,
                            bytes_up, bytes_down, pkts_up, pkts_down, flows)
-                       SELECT bucket, ?, remote_ip, port, proto, app, country, asn,
+                       SELECT bucket, ?, remote_ip, port, proto, app, domain, country, asn,
                            bytes_up, bytes_down, pkts_up, pkts_down, flows
                        FROM traffic WHERE local_ip = ?
                        ON CONFLICT DO UPDATE SET
@@ -157,9 +158,9 @@ class Store:
                 db.execute("DELETE FROM traffic WHERE local_ip = ?", (old,))
                 # the other end of local traffic
                 db.execute(
-                    """INSERT INTO traffic (bucket, local_ip, remote_ip, port, proto, app, country, asn,
+                    """INSERT INTO traffic (bucket, local_ip, remote_ip, port, proto, app, domain, country, asn,
                            bytes_up, bytes_down, pkts_up, pkts_down, flows)
-                       SELECT bucket, local_ip, ?, port, proto, app, country, asn,
+                       SELECT bucket, local_ip, ?, port, proto, app, domain, country, asn,
                            bytes_up, bytes_down, pkts_up, pkts_down, flows
                        FROM traffic WHERE remote_ip = ?
                        ON CONFLICT DO UPDATE SET
@@ -188,9 +189,9 @@ class Store:
             db.execute("CREATE TEMP TABLE lan_remotes (ip TEXT PRIMARY KEY)")
             db.executemany("INSERT INTO lan_remotes VALUES (?)", [(r,) for r in remotes])
             db.execute(
-                """INSERT INTO traffic (bucket, local_ip, remote_ip, port, proto, app, country, asn,
+                """INSERT INTO traffic (bucket, local_ip, remote_ip, port, proto, app, domain, country, asn,
                        bytes_up, bytes_down, pkts_up, pkts_down, flows)
-                   SELECT bucket, remote_ip, local_ip, port, proto, '', 'LAN', 0,
+                   SELECT bucket, remote_ip, local_ip, port, proto, '', domain, 'LAN', 0,
                        bytes_down, bytes_up, pkts_down, pkts_up, flows
                    FROM traffic WHERE country = 'LAN' AND remote_ip IN (SELECT ip FROM lan_remotes)
                    ON CONFLICT DO UPDATE SET
@@ -210,17 +211,19 @@ class Store:
     def _migrate(db):
         """Databases from before app attribution: add the app column to the key."""
         cols = [r[1] for r in db.execute("PRAGMA table_info(traffic)")]
-        if not cols or "app" in cols:
+        missing = [c for c in ("app", "domain") if c not in cols]
+        if not cols or not missing:
             return
-        log.info("upgrading database: adding app column (one-off, may take a moment)")
+        log.info("upgrading database: adding %s (one-off, may take a moment)", ", ".join(missing))
         db.execute("DROP INDEX IF EXISTS traffic_country")
         db.execute("DROP INDEX IF EXISTS traffic_local")
         db.execute("ALTER TABLE traffic RENAME TO traffic_old")
         db.executescript(SCHEMA)
-        db.execute("""INSERT INTO traffic (bucket, local_ip, remote_ip, port, proto, country, asn,
-                          bytes_up, bytes_down, pkts_up, pkts_down, flows, app)
+        app = "app" if "app" in cols else "''"
+        db.execute(f"""INSERT INTO traffic (bucket, local_ip, remote_ip, port, proto, country, asn,
+                          bytes_up, bytes_down, pkts_up, pkts_down, flows, app, domain)
                       SELECT bucket, local_ip, remote_ip, port, proto, country, asn,
-                          bytes_up, bytes_down, pkts_up, pkts_down, flows, ''
+                          bytes_up, bytes_down, pkts_up, pkts_down, flows, {app}, ''
                       FROM traffic_old""")
         db.execute("DROP TABLE traffic_old")
         db.commit()
@@ -272,6 +275,7 @@ class Store:
                 if not sides:
                     self.stats["unclassified_flows"] += 1
                     continue
+                dom = attr.domain_for(f) if attr else ""
                 if f.proto in (6, 17, 132):  # service port, from the (post-NAT) ports
                     port = min(sport, dport) if sport and dport else (sport or dport)
                 else:
@@ -284,7 +288,7 @@ class Store:
                         local, mac = addr, None  # filed under the device's IPv4 address
                     if ":" in remote and is_local(remote):
                         remote = self.device_ip(remote)
-                    key = (bucket, local, remote, port, f.proto, app)
+                    key = (bucket, local, remote, port, f.proto, app, dom)
                     agg = self._pending.get(key)
                     if agg is None:
                         agg = self._pending[key] = [0, 0, 0, 0, 0]
@@ -308,19 +312,19 @@ class Store:
             return
         rows = []
         new_asns = []
-        for (bucket, local, remote, port, proto, app), (bu, bd, pu, pd, n) in pending.items():
+        for (bucket, local, remote, port, proto, app, dom), (bu, bd, pu, pd, n) in pending.items():
             cc = self.geo.lookup_country(remote)
             asn, org = self.geo.lookup_asn(remote)
             if asn and asn not in self._asn_seen:
                 self._asn_seen[asn] = org
                 new_asns.append((asn, org))
-            rows.append((bucket, local, remote, port, proto, app, cc, asn, bu, bd, pu, pd, n))
+            rows.append((bucket, local, remote, port, proto, app, dom, cc, asn, bu, bd, pu, pd, n))
         db = self.db()
         with db:
             db.executemany(
-                """INSERT INTO traffic (bucket, local_ip, remote_ip, port, proto, app, country,
+                """INSERT INTO traffic (bucket, local_ip, remote_ip, port, proto, app, domain, country,
                        asn, bytes_up, bytes_down, pkts_up, pkts_down, flows)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT DO UPDATE SET
                        bytes_up = bytes_up + excluded.bytes_up,
                        bytes_down = bytes_down + excluded.bytes_down,
@@ -362,6 +366,14 @@ class Store:
                        ON CONFLICT(ip) DO UPDATE SET name = excluded.name,
                            name_source = excluded.name_source""",
                     (ip, name or None, source if name else None))
+
+    def set_device_flag(self, ip, flag, value):
+        if flag not in ("no_internet",):
+            raise ValueError(flag)
+        db = self.db()
+        with db:
+            db.execute(f"""INSERT INTO devices (ip, {flag}) VALUES (?, ?)
+                           ON CONFLICT(ip) DO UPDATE SET {flag} = excluded.{flag}""", (ip, int(value)))
 
     def set_device_mac(self, ip, mac):
         db = self.db()

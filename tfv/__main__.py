@@ -10,6 +10,7 @@ import threading
 import time
 import tomllib
 
+from .alerts import Alerts
 from .attribution import Attribution
 from .geo import Geo
 from .mikrotik import LeaseSync
@@ -34,6 +35,10 @@ DEFAULTS = {
     # Shared secret for agents that report which app owns each connection
     # (tfv/agent.py). Agent reports are refused until this is set.
     "agent": {"token": os.environ.get("TFV_AGENT_TOKEN", "")},
+    # Networks whose devices should never reach the internet (e.g. cameras); any
+    # internet traffic from them raises an alert. Devices can also be marked in the UI.
+    "alerts": {"no_internet_networks": [n.strip() for n in
+                                        os.environ.get("TFV_NO_INTERNET_NETWORKS", "").split(",") if n.strip()]},
     "mikrotik": {"enabled": False, "url": "", "username": "", "password": "",
                  "verify_tls": True, "interval": 300},
 }
@@ -129,8 +134,9 @@ def main():
     threading.Thread(target=housekeeping, args=(store, decoder), daemon=True,
                      name="housekeeping").start()
     w = cfg["web"]
+    alerts = Alerts(store, collector, attribution, cfg["alerts"].get("no_internet_networks", []))
     app = App(store, decoder, collector, geo, lease_sync, w.get("username"), w.get("password"),
-              attribution, cfg["agent"].get("token") or os.environ.get("TFV_AGENT_TOKEN", ""))
+              attribution, cfg["agent"].get("token") or os.environ.get("TFV_AGENT_TOKEN", ""), alerts)
     # As PID 1 in a container we get SIGTERM on `docker stop` (and on every
     # automatic update); exit promptly and save the last few seconds of flows.
     def on_term(*_):

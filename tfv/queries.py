@@ -7,7 +7,7 @@ NICE_STEPS = [60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 864
 CONNECTION_SORTS = {
     "total": "total", "down": "down", "up": "up", "flows": "flows",
     "last": "last", "first": "first", "local": "t.local_ip", "remote": "t.remote_ip",
-    "country": "t.country", "port": "t.port", "org": "org", "name": "name", "app": "t.app",
+    "country": "t.country", "port": "t.port", "org": "org", "name": "name", "app": "t.app", "domain": "t.domain",
 }
 
 
@@ -21,7 +21,7 @@ def _int(v, default=None):
 FILTER_COLUMNS = {
     "device": ("t.local_ip", str), "country": ("t.country", str), "remote": ("t.remote_ip", str),
     "port": ("t.port", _int), "proto": ("t.proto", _int), "asn": ("t.asn", _int),
-    "app": ("t.app", str),
+    "app": ("t.app", str), "domain": ("t.domain", str),
 }
 
 
@@ -50,8 +50,9 @@ def build_filter(params, bucket_seconds):
     if q:
         like = f"%{q}%"
         where.append("""(t.local_ip LIKE ? OR t.remote_ip LIKE ? OR t.country LIKE ?
-                         OR d.name LIKE ? OR a.org LIKE ? OR t.app LIKE ? OR CAST(t.port AS TEXT) = ?)""")
-        args += [like, like, like, like, like, like, q]
+                         OR d.name LIKE ? OR a.org LIKE ? OR t.app LIKE ? OR t.domain LIKE ?
+                         OR CAST(t.port AS TEXT) = ?)""")
+        args += [like, like, like, like, like, like, like, q]
     return " AND ".join(where), args, frm, to
 
 
@@ -60,7 +61,7 @@ FROM = """FROM traffic t
           LEFT JOIN asn_names a ON a.asn = t.asn"""
 
 
-def summary(db, params, bucket_seconds):
+def summary(db, params, bucket_seconds, servers=()):
     where, args, frm, to = build_filter(params, bucket_seconds)
     span = max(to - frm, bucket_seconds)
     step = next((s for s in NICE_STEPS if s >= bucket_seconds and span / s <= 150),
@@ -134,13 +135,26 @@ def summary(db, params, bucket_seconds):
                     ORDER BY SUM(bytes_down + bytes_up) DESC LIMIT 300""")
     for r in apps:
         r["hosts"] = sorted(set((r["hosts"] or "").split(",")) - {""})[:6]
+    # Local streams are stored on both ends; count domains from the server's side
+    # unless we are looking at one device.
+    server_side = ""
+    if servers and not params.get("device"):
+        server_side = "AND t.local_ip IN (%s)" % ",".join("'%s'" % s.replace("'", "") for s in servers)
+    domains = rows(f"""SELECT t.domain domain, SUM(bytes_down) down, SUM(bytes_up) up, SUM(flows) flows,
+                          COUNT(DISTINCT t.local_ip) devices, COUNT(DISTINCT t.remote_ip) remotes,
+                          COUNT(DISTINCT t.country) countries,
+                          GROUP_CONCAT(DISTINCT t.app) apps
+                       {FROM} WHERE {where} AND t.domain != '' {server_side} GROUP BY t.domain
+                       ORDER BY SUM(bytes_down + bytes_up) DESC LIMIT 300""")
+    for r in domains:
+        r["apps"] = sorted(set((r["apps"] or "").split(",")) - {""})[:4]
     for r in remotes:
         r["ports"] = sorted({int(p) for p in (r["ports"] or "").split(",") if p})[:8]
     for r in orgs:
         r["countries"] = sorted(set((r["countries"] or "").split(",")) - {""})
     return {"from": frm, "to": to, "step": step, "totals": totals, "series": series,
             "countries": countries, "devices": devices, "remotes": remotes,
-            "ports": ports, "orgs": orgs, "apps": apps}
+            "ports": ports, "orgs": orgs, "apps": apps, "domains": domains}
 
 
 def connections(db, params, bucket_seconds):
@@ -149,17 +163,17 @@ def connections(db, params, bucket_seconds):
     order = "ASC" if params.get("dir") == "asc" else "DESC"
     limit = min(_int(params.get("limit"), 200), 2000)
     offset = max(_int(params.get("offset"), 0), 0)
-    sql = f"""SELECT t.local_ip local, d.name name, t.app app, t.remote_ip remote, t.country cc,
+    sql = f"""SELECT t.local_ip local, d.name name, t.app app, t.domain domain, t.remote_ip remote, t.country cc,
                      t.asn asn, a.org org, t.port port, t.proto proto,
                      SUM(bytes_down) down, SUM(bytes_up) up,
                      SUM(bytes_down + bytes_up) total, SUM(flows) flows,
                      MIN(t.bucket) first, MAX(t.bucket) last
               {FROM} WHERE {where}
-              GROUP BY t.local_ip, t.app, t.remote_ip, t.port, t.proto
+              GROUP BY t.local_ip, t.app, t.domain, t.remote_ip, t.port, t.proto
               ORDER BY {sort} {order} LIMIT ? OFFSET ?"""
     rows = [dict(r) for r in db.execute(sql, (*args, limit, offset))]
     count = db.execute(f"""SELECT COUNT(*) FROM (SELECT 1 {FROM} WHERE {where}
-                           GROUP BY t.local_ip, t.app, t.remote_ip, t.port, t.proto)""",
+                           GROUP BY t.local_ip, t.app, t.domain, t.remote_ip, t.port, t.proto)""",
                        args).fetchone()[0]
     return {"from": frm, "to": to, "count": count, "rows": rows}
 
@@ -207,6 +221,7 @@ VALUE_QUERIES = {
     "port": ("t.port", "''", "CAST(t.port AS TEXT) LIKE ?"),
     "proto": ("t.proto", "''", "CAST(t.proto AS TEXT) LIKE ?"),
     "app": ("t.app", "''", "t.app LIKE ?"),
+    "domain": ("t.domain", "''", "t.domain LIKE ?"),
 }
 
 

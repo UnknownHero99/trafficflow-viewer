@@ -36,12 +36,19 @@ class Attribution:
         self.agents = {}     # agent name -> {"last", "exact", "bound", "ips"}
         self.stats = {"matched": 0, "unmatched": 0}
         self.rejected = {}   # sender address -> {"reason", "count", "last"}, to show in Status
+        # (server_ip, server_port, client_ip, client_port) -> (domain, expires): what
+        # clients asked a reverse proxy for (TLS server name / HTTP Host)
+        self.domains = {}
+        self.domain_errors = {}  # agent -> why it can't read domains ("" = working)
         self._pruned = time.time()
 
-    def report(self, agent, exact, bound, ips):
+    def report(self, agent, exact, bound, ips, domains=(), domains_error=""):
         now = time.time()
         exp = now + TTL
         with self.lock:
+            for sip, sport, cip, cport, name in domains:
+                self.domains[(sip, int(sport), cip, int(cport))] = (name, exp)
+            self.domain_errors[agent] = domains_error or ""
             for ip, proto, lport, rip, rport, app in exact:
                 self.exact[(ip, int(proto), int(lport), rip, int(rport))] = (app, exp)
             for ip, proto, port, app in bound:
@@ -56,6 +63,7 @@ class Attribution:
 
     def _prune(self, now):
         self.exact = {k: v for k, v in self.exact.items() if v[1] > now}
+        self.domains = {k: v for k, v in self.domains.items() if v[1] > now}
         self.bound = {k: v for k, v in self.bound.items() if v[1] > now}
         self._pruned = now
 
@@ -77,6 +85,26 @@ class Attribution:
         self.stats["unmatched"] += 1
         return ""
 
+    def domain_for(self, f):
+        """Proxy domain of the connection a flow record belongs to, or "".
+
+        The agent sees connections as the server does. A record arriving at the
+        router either still has the client's addresses before NAT (client ->
+        server: compare after NAT) or is the server's reply (compare before NAT).
+        """
+        if not self.domains:
+            return ""
+        a_post = (f.nat_src or f.src, f.nat_sport or f.sport)
+        b_post = (f.nat_dst or f.dst, f.nat_dport or f.dport)
+        now = time.time()
+        with self.lock:
+            for key in ((b_post[0], b_post[1], a_post[0], a_post[1]),
+                        (f.src, f.sport, f.dst, f.dport)):
+                hit = self.domains.get(key)
+                if hit and hit[1] > now:
+                    return hit[0]
+        return ""
+
     def reject(self, sender, reason):
         with self.lock:
             r = self.rejected.setdefault(sender, {"count": 0})
@@ -87,4 +115,5 @@ class Attribution:
         with self.lock:
             return {"agents": {k: dict(v) for k, v in self.agents.items()},
                     "rejected": {k: dict(v) for k, v in self.rejected.items()},
+                    "domain_errors": dict(self.domain_errors), "domain_entries": len(self.domains),
                     "entries": len(self.exact) + len(self.bound), **self.stats}

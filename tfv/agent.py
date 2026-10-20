@@ -31,6 +31,7 @@ import urllib.parse
 import urllib.request
 
 from .attribution import clean_token, token_fingerprint
+from .sniff import DEFAULT_PORTS, Sniffer
 
 log = logging.getLogger("tfv.agent")
 
@@ -211,7 +212,7 @@ class ProcessMap:
 # ---- the agent loop ------------------------------------------------------------
 class Agent:
     def __init__(self, url, token, name=None, interval=0.5, docker_sock="/var/run/docker.sock",
-                 proc="/proc"):
+                 proc="/proc", proxy_ports=DEFAULT_PORTS):
         self.url = url.rstrip("/") + "/api/agent/report"
         self.token = clean_token(token)
         self.name = name or socket.gethostname()
@@ -223,6 +224,10 @@ class Agent:
         self.containers_at = 0
         self.sent = {}   # entry -> last time sent
         self.wake = threading.Event()  # set by the kernel's "new connection" events
+        self.container_ips = set()
+        self.sniffer = Sniffer(proxy_ports, on_found=self.wake.set,
+                               skip_dst=lambda ip: ip in self.container_ips) if proxy_ports else None
+        self.domains = {}  # found proxy domains not yet accepted by the viewer
         self.nat = (set(), set())  # (exact entries, host ips) from the last NAT table read
         self.nat_at = 0
         self.warned = set()
@@ -243,6 +248,7 @@ class Agent:
                 self.containers = []
             self.containers_at = now
         by_ip = {ip: c["name"] for c in self.containers for ip in c["ips"]}
+        self.container_ips = set(by_ip)
         by_id = {c["id"]: c["name"] for c in self.containers}
         published = {}
         for c in self.containers:
@@ -304,10 +310,14 @@ class Agent:
         due = lambda e: now - self.sent.get(e, 0) > RESEND  # noqa: E731
         new_exact = [e for e in exact if due(e)]
         new_bound = [b for b in bound if due(b)]
+        if self.sniffer:
+            self.domains.update(self.sniffer.take())
         # keep the viewer's list of covered addresses fresh even when nothing changed
-        if new_exact or new_bound or now - self.sent.get("ips", 0) > RESEND:
+        if new_exact or new_bound or self.domains or now - self.sent.get("ips", 0) > RESEND:
             body = json.dumps({"agent": self.name, "ips": sorted(host_ips),
-                               "exact": new_exact, "bound": new_bound}).encode()
+                               "exact": new_exact, "bound": new_bound,
+                               "domains": [[*k, v] for k, v in self.domains.items()],
+                               "domains_error": self.sniffer.error if self.sniffer else "off"}).encode()
             req = urllib.request.Request(self.url, data=body, method="POST", headers={
                 "Content-Type": "application/json",
                 # HTTP headers are Latin-1 only; percent-encode so any token works (č, š, ž…)
@@ -316,6 +326,7 @@ class Agent:
                 r.read()
             for e in new_exact + new_bound:
                 self.sent[e] = now
+            self.domains = {}
             self.sent["ips"] = now
         live = exact | bound
         self.sent = {k: v for k, v in self.sent.items() if k == "ips" or k in live}
@@ -343,6 +354,8 @@ class Agent:
         log.info("agent %s reporting to %s (every %ss and on new connections)", self.name, self.url,
                  self.interval)
         self.watch_new_connections()
+        if self.sniffer:
+            self.sniffer.start()
         log.info("token fingerprint %s (must match the viewer's Status tab)", token_fingerprint(self.token))
         failures = 0
         while True:
@@ -380,7 +393,17 @@ def main():
     Agent(url, token, os.environ.get("TFV_AGENT_NAME") or None,
           float(os.environ.get("TFV_AGENT_INTERVAL", "0.5")),
           os.environ.get("TFV_DOCKER_SOCKET", "/var/run/docker.sock"),
-          os.environ.get("TFV_PROC", "/proc")).run()
+          os.environ.get("TFV_PROC", "/proc"),
+          _ports(os.environ.get("TFV_AGENT_PROXY_PORTS"))).run()
+
+
+def _ports(value):
+    """TFV_AGENT_PROXY_PORTS: comma-separated ports, "off" to disable; unset = defaults."""
+    if value is None or not value.strip():
+        return DEFAULT_PORTS
+    if value.strip().lower() in ("0", "off", "no", "false"):
+        return ()
+    return tuple(int(p) for p in value.replace(" ", "").split(",") if p)
 
 
 if __name__ == "__main__":

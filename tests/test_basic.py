@@ -359,3 +359,140 @@ class HairpinAndAgentFixesTest(unittest.TestCase):
         header.encode("latin-1")  # must be sendable as an HTTP header
         self.assertTrue(hmac.compare_digest(urllib.parse.unquote(header).encode(), token.encode()))
         self.assertEqual(urllib.parse.quote("abc-DEF_123", safe=_TOKEN_SAFE), "abc-DEF_123")  # plain tokens unchanged
+
+
+def _client_hello(sni, pad=0):
+    import struct
+    name = sni.encode()
+    sni_ext = struct.pack("!HHHBH", 0, len(name) + 5, len(name) + 3, 0, len(name)) + name
+    padding = struct.pack("!HH", 0x0015, pad) + b"\x00" * pad          # pushes SNI into a 2nd packet
+    exts = padding + struct.pack("!HH", 0x002b, 3) + b"\x02\x03\x04" + sni_ext
+    body = b"\x03\x03" + b"\x00" * 32 + b"\x00" + struct.pack("!H", 2) + b"\x13\x01" + b"\x01\x00" + \
+        struct.pack("!H", len(exts)) + exts
+    hs = b"\x01" + len(body).to_bytes(3, "big") + body
+    return b"\x16\x03\x01" + struct.pack("!H", len(hs)) + hs
+
+
+def _ipv4_tcp(src, dst, sport, dport, payload):
+    import socket, struct
+    tcp = struct.pack("!HHIIBBHHH", sport, dport, 1, 0, 5 << 4, 0x18, 65535, 0, 0)
+    total = 20 + len(tcp) + len(payload)
+    ip = struct.pack("!BBHHHBBH4s4s", 0x45, 0, total, 0, 0, 64, 6, 0,
+                     socket.inet_aton(src), socket.inet_aton(dst))
+    return ip + tcp + payload
+
+
+class ProxyDomainTest(unittest.TestCase):
+    def test_parsers(self):
+        from tfv.sniff import http_host, tls_server_name
+        self.assertEqual(tls_server_name(_client_hello("Jellyfin.Bajta.net")), ("jellyfin.bajta.net", 0))
+        hello = _client_hello("x.example", pad=1500)
+        self.assertEqual(tls_server_name(hello[:600]), (None, len(hello)))
+        self.assertEqual(http_host(b"GET / HTTP/1.1\r\nHost: Cloud.Example.org:9080\r\nX: y\r\n\r\n"), "cloud.example.org")
+        self.assertEqual(http_host(b"\x16\x03\x01junk"), "")
+
+    def test_filter_program(self):
+        from tfv.sniff import proxy_filter
+        prog = proxy_filter([9443, 9080])
+        self.assertTrue(all(0 <= jt <= 255 and 0 <= jf <= 255 for _, jt, jf, _ in prog))
+        self.assertEqual(prog[-1], (0x06, 0, 0, 0))       # drop
+        self.assertEqual(prog[-2], (0x06, 0, 0, 65535))   # accept
+
+    def test_sniffer_reassembles_and_skips(self):
+        from tfv.sniff import Sniffer
+        s = Sniffer((9443,), skip_dst=lambda ip: ip == "172.17.0.5")
+        hello = _client_hello("photos.bajta.net", pad=1500)
+        s.handle(_ipv4_tcp("192.168.10.1", "192.168.10.10", 40752, 9443, hello[:1400]))
+        self.assertEqual(s.take(), {})
+        s.handle(_ipv4_tcp("192.168.10.1", "192.168.10.10", 40752, 9443, hello[1400:]))
+        self.assertEqual(s.take(), {("192.168.10.10", 9443, "192.168.10.1", 40752): "photos.bajta.net"})
+        s.handle(_ipv4_tcp("192.168.10.10", "142.250.1.1", 5000, 9443, _client_hello("x.com")))  # outgoing
+        s.handle(_ipv4_tcp("10.0.0.2", "172.17.0.5", 5000, 9443, _client_hello("y.com")))       # container
+        self.assertEqual(s.take(), {})
+
+    def test_domain_through_hairpin_and_storage(self):
+        from tfv.attribution import Attribution
+        attr = Attribution()
+        attr.report("srv", [], [], {"192.168.10.10"},
+                    [("192.168.10.10", 9443, "192.168.10.1", 40752, "jellyfin.bajta.net"),
+                     ("192.168.10.10", 9443, "93.103.1.1", 5555, "jellyfin.bajta.net")])
+        with tempfile.TemporaryDirectory() as tmp:
+            fakeflow.write_demo_geo(tmp)
+            geo = Geo(tmp, auto_download=False)
+            geo.start()
+            st = Store(os.path.join(tmp, "db.sqlite"), geo, Classifier(["192.168.0.0/16"]), attribution=attr)
+            rep = Flow()  # server -> device through hairpin NAT (as the router reports it)
+            rep.src, rep.sport, rep.dst, rep.dport, rep.proto, rep.bytes, rep.packets = \
+                "192.168.10.10", 9443, "192.168.10.1", 40752, 6, 5_000_000, 3500
+            rep.nat_src, rep.nat_dst, rep.nat_sport, rep.nat_dport = "213.143.93.247", "192.168.1.57", 443, 40752
+            ext = Flow()  # external visitor arriving on the WAN port
+            ext.src, ext.sport, ext.dst, ext.dport, ext.proto, ext.bytes, ext.packets = \
+                "93.103.1.1", 5555, "213.143.93.247", 443, 6, 1_000, 10
+            ext.nat_dst, ext.nat_dport = "192.168.10.10", 9443
+            st.add_flows([rep, ext], now=1_000_000)
+            st.flush()
+            p = {"from": "999000", "to": "1001000"}
+            doms = queries.summary(st.db(), p, 60, servers=["192.168.10.10"])["domains"]
+            self.assertEqual([(d["domain"], d["up"], d["down"], d["remotes"]) for d in doms],
+                             [("jellyfin.bajta.net", 5_000_000, 1_000, 2)])
+            dev = queries.summary(st.db(), {**p, "device": "192.168.1.57"}, 60, servers=["192.168.10.10"])
+            self.assertEqual([(d["domain"], d["down"]) for d in dev["domains"]], [("jellyfin.bajta.net", 5_000_000)])
+
+    def test_upgrade_adds_domain_column(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "db.sqlite")
+            c = sqlite3.connect(path)
+            c.executescript("""CREATE TABLE traffic (bucket INTEGER NOT NULL, local_ip TEXT NOT NULL,
+                remote_ip TEXT NOT NULL, port INTEGER NOT NULL, proto INTEGER NOT NULL, country TEXT NOT NULL,
+                asn INTEGER NOT NULL, bytes_up INTEGER NOT NULL DEFAULT 0, bytes_down INTEGER NOT NULL DEFAULT 0,
+                pkts_up INTEGER NOT NULL DEFAULT 0, pkts_down INTEGER NOT NULL DEFAULT 0,
+                flows INTEGER NOT NULL DEFAULT 0, app TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (bucket, local_ip, remote_ip, port, proto, app)) WITHOUT ROWID;
+                INSERT INTO traffic VALUES (60, '192.168.1.5', '1.1.1.1', 443, 6, 'AU', 13335, 10, 20, 1, 2, 1, 'curl');
+                PRAGMA user_version = 3;""")
+            c.close()
+            fakeflow.write_demo_geo(tmp)
+            geo = Geo(tmp, auto_download=False)
+            st = Store(path, geo, Classifier(["192.168.0.0/16"]))
+            row = st.db().execute("SELECT app, domain, bytes_up, bytes_down FROM traffic").fetchone()
+            self.assertEqual(tuple(row), ("curl", "", 10, 20))
+
+
+class AlertsTest(unittest.TestCase):
+    def test_alerts(self):
+        import time as _t
+        from tfv.alerts import Alerts
+        with tempfile.TemporaryDirectory() as tmp:
+            fakeflow.write_demo_geo(tmp)
+            geo = Geo(tmp, auto_download=False)
+            geo.start()
+            st = Store(os.path.join(tmp, "db.sqlite"), geo, Classifier(["192.168.0.0/16"]))
+            now = int(_t.time())
+            db = st.db()
+            ins = """INSERT INTO traffic (bucket, local_ip, remote_ip, port, proto, app, domain, country, asn,
+                         bytes_up, bytes_down, flows) VALUES (?,?,?,?,?,'','',?,0,?,?,1)"""
+            with db:
+                # two days of normal history for the laptop, then a big last hour
+                for h in range(48, 1, -1):
+                    db.execute(ins, (now - h * 3600, "192.168.10.248", "1.1.1.1", 443, 6, "AU", 1_000_000,
+                                     200_000_000 if h == 20 else 10_000_000))  # one busy evening: not a spike
+                db.execute(ins, (now - 600, "192.168.10.248", "142.250.1.1", 443, 6, "US", 50_000_000, 900_000_000))
+                # a camera on the cameras network talking to the internet
+                db.execute(ins, (now - 900, "192.168.40.10", "47.91.94.88", 32991, 6, "DE", 900_000, 600_000))
+                db.execute("INSERT INTO devices (ip, name, first_seen, last_seen) VALUES (?,?,?,?)",
+                           ("192.168.40.10", "Kamera", now - 3 * 86400, now))
+                db.execute("INSERT INTO devices (ip, first_seen, last_seen, mac) VALUES (?,?,?,?)",
+                           ("192.168.1.77", now - 3600, now, "aa:bb:cc:dd:ee:ff"))
+            al = Alerts(st, no_internet_networks=["192.168.40.0/24"])
+            kinds = {a["key"].split(":")[0]: a for a in al.active()}
+            self.assertIn("internet", kinds)
+            self.assertIn("Kamera used the internet", kinds["internet"]["title"])
+            self.assertIn("spike", kinds)
+            self.assertIn("new", kinds)
+            al.ack([kinds["internet"]["key"]])
+            self.assertNotIn("internet", {a["key"].split(":")[0] for a in al.active()})
+            # per-device flag works too
+            st.set_device_flag("192.168.10.248", "no_internet", True)
+            al.ack([])
+            self.assertTrue(any(a["key"].startswith("internet:192.168.10.248") for a in al.active()))

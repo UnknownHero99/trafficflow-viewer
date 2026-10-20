@@ -52,8 +52,9 @@ class RDNS:
 
 class App:
     def __init__(self, store, decoder, collector, geo, lease_sync=None,
-                 username=None, password=None, attribution=None, agent_token=""):
+                 username=None, password=None, attribution=None, agent_token="", alerts=None):
         self.attribution = attribution
+        self.alerts = alerts
         self.agent_token = clean_token(agent_token)
         self.store = store
         self.decoder = decoder
@@ -152,7 +153,8 @@ def make_handler(app):
             bs = app.store.bucket_seconds
             try:
                 if path == "/api/summary":
-                    return self._send(200, queries.summary(db, params, bs))
+                    servers = sorted(app.attribution.hosts) if app.attribution else ()
+                    return self._send(200, queries.summary(db, params, bs, servers))
                 if path == "/api/connections":
                     data = queries.connections(db, params, bs)
                     if params.get("format") == "csv":
@@ -164,6 +166,8 @@ def make_handler(app):
                     return self._send(200, queries.country_timeline(db, params, bs))
                 if path == "/api/devices":
                     return self._send(200, queries.devices(db, params, bs))
+                if path == "/api/alerts":
+                    return self._send(200, {"alerts": app.alerts.active() if app.alerts else []})
                 if path == "/api/status":
                     return self._send(200, app.status())
                 if path == "/api/debug/flows":
@@ -193,8 +197,16 @@ def make_handler(app):
                 ip = str(body.get("ip", "")).strip()
                 if not ip:
                     return self._send(400, {"error": "ip required"})
-                name = str(body.get("name", "")).strip()[:100]
-                app.store.set_device_name(ip, name, "manual")
+                if "name" in body:
+                    app.store.set_device_name(ip, str(body.get("name") or "").strip()[:100], "manual")
+                if "no_internet" in body:
+                    app.store.set_device_flag(ip, "no_internet", bool(body["no_internet"]))
+                    if app.alerts:
+                        app.alerts.ack([])  # recompute
+                return self._send(200, {"ok": True})
+            if self.path == "/api/alerts/ack" and app.alerts:
+                keys = [str(k)[:300] for k in body.get("keys", [])][:500]
+                app.alerts.ack(keys)
                 return self._send(200, {"ok": True})
             if self.path == "/api/lease-sync" and app.lease_sync:
                 try:
@@ -226,6 +238,9 @@ def make_handler(app):
                      for ip, p, lp, rip, rp, a in body.get("exact", [])],
                     [(str(ip), int(p), int(port), str(a)[:64]) for ip, p, port, a in body.get("bound", [])],
                     {str(ip) for ip in body.get("ips", [])},
+                    [(str(s), int(sp), str(c), int(cp), str(n)[:253])
+                     for s, sp, c, cp, n in body.get("domains", [])],
+                    str(body.get("domains_error") or "")[:200],
                 )
             except (ValueError, TypeError) as e:
                 return self._send(400, {"error": f"bad report: {e}"})
@@ -233,7 +248,7 @@ def make_handler(app):
 
         def _csv(self, rows):
             buf = io.StringIO()
-            cols = ["local", "name", "app", "remote", "cc", "asn", "org", "port", "proto",
+            cols = ["local", "name", "app", "domain", "remote", "cc", "asn", "org", "port", "proto",
                     "down", "up", "total", "flows", "first", "last"]
             w = csv.writer(buf)
             w.writerow(cols)

@@ -14,6 +14,7 @@
     <span>TrafficFlow</span>
   </div>
   <div id="status-pill" class="pill" title="Collector status">…</div>
+  <button id="alert-pill" class="pill alert-pill" hidden title="Show alerts"></button>
   <div class="spacer"></div>
   <div class="seg" id="range" role="group" aria-label="Time range">
     <button data-r="900">15m</button><button data-r="3600">1h</button><button data-r="21600">6h</button><button data-r="86400">24h</button><button data-r="604800">7d</button><button data-r="2592000">30d</button>
@@ -47,10 +48,12 @@
       <button data-tab="heatmap">Country heatmap</button>
       <button data-tab="devices">My devices</button>
       <button data-tab="apps">Apps</button>
+      <button data-tab="domains">Domains</button>
       <button data-tab="orgs">Organisations</button>
       <button data-tab="remotes">Remote hosts</button>
       <button data-tab="ports">Services</button>
       <button data-tab="connections">Connections</button>
+      <button data-tab="alerts">Alerts</button>
       <button data-tab="status">Status</button>
     </nav>
     <div id="panel" class="panel"></div>

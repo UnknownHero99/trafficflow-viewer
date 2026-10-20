@@ -13,6 +13,7 @@ services:
     environment:
       - TZ=${TZ:-Europe/Ljubljana}
       - TFV_AGENT_TOKEN=${TFV_AGENT_TOKEN:-}
+      - TFV_NO_INTERNET_NETWORKS=${TFV_NO_INTERNET_NETWORKS:-}
     labels:
       # opt in to automatic updates (Watchtower below ignores every other container)
       - com.centurylinklabs.watchtower.enable=true
@@ -31,7 +32,7 @@ services:
       disable: true   # the image's check probes the web UI, which the agent doesn't serve
     network_mode: host
     pid: host
-    cap_add: [NET_ADMIN, SYS_PTRACE]
+    cap_add: [NET_ADMIN, SYS_PTRACE, NET_RAW]
     security_opt: ["apparmor:unconfined"]
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
